@@ -1,0 +1,16 @@
+# ninja log v7
+1	339	1783288269592387152	photogod_autogen/timestamp	73eb71d58fabd533
+1	339	1783288269592387152	photogod_autogen/mocs_compilation.cpp	73eb71d58fabd533
+1	339	1783288269592387152	/home/kavang/Desktop/photogod/build/photogod_autogen/timestamp	73eb71d58fabd533
+1	339	1783288269592387152	/home/kavang/Desktop/photogod/build/photogod_autogen/mocs_compilation.cpp	73eb71d58fabd533
+341	2851	1783288269603118421	CMakeFiles/photogod.dir/src/Filters.cpp.o	d1a9b661ba9b0f56
+341	3179	1783288269603034836	CMakeFiles/photogod.dir/src/Layer.cpp.o	463cb5bc4db3a966
+340	3509	1783288269602593161	CMakeFiles/photogod.dir/photogod_autogen/mocs_compilation.cpp.o	1f674b5e613d2095
+340	3580	1783288269602712265	CMakeFiles/photogod.dir/src/main.cpp.o	575af6d1bef8b07d
+341	3679	1783288269603215059	CMakeFiles/photogod.dir/src/Commands.cpp.o	f6a0de3b706f1d2b
+341	3975	1783288269603425304	CMakeFiles/photogod.dir/src/Dialogs.cpp.o	6b193cf214e5b8dc
+340	4753	1783288269602885159	CMakeFiles/photogod.dir/src/Canvas.cpp.o	7747f544e0addd68
+341	4900	1783288269602960553	CMakeFiles/photogod.dir/src/Document.cpp.o	cad50fa736779f86
+341	5934	1783288269603304636	CMakeFiles/photogod.dir/src/Panels.cpp.o	6ece816ba8b03083
+340	6448	1783288269602809870	CMakeFiles/photogod.dir/src/MainWindow.cpp.o	b69170b5b5bc0fc4
+6448	6683	1783288275709422394	photogod	c1bc86577e86092

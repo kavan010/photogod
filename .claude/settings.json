@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pacman -Q qt6-base qt6-imageformats cmake gcc ninja)",
+      "Bash(cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release)",
+      "Bash(ninja -C build)",
+      "Bash(QT_QPA_PLATFORM=offscreen /home/kavang/Desktop/photogod/build/photogod --selftest shot1.png)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(echo \"build rc=$?\")",
+      "Bash(QT_QPA_PLATFORM=offscreen ./build/photogod --modeltest)",
+      "Bash(echo \"test rc=$?\")",
+      "Bash(pkill -f \"photogod --selftest\")",
+      "Bash(timeout 30 env QT_QPA_PLATFORM=offscreen ./build/photogod --selftest)",
+      "Bash(echo \"final rc=$?\")"
+    ]
+  }
+}
