@@ -11,7 +11,18 @@
       "Bash(echo \"test rc=$?\")",
       "Bash(pkill -f \"photogod --selftest\")",
       "Bash(timeout 30 env QT_QPA_PLATFORM=offscreen ./build/photogod --selftest)",
-      "Bash(echo \"final rc=$?\")"
+      "Bash(echo \"final rc=$?\")",
+      "Bash(pacman -Q qt6-svg)",
+      "Read(//usr/lib/qt6/plugins/imageformats/**)",
+      "Bash(echo \"build done rc=$?\")",
+      "Bash(echo \"rc=$?\")",
+      "Bash(timeout 15 env QT_QPA_PLATFORM=offscreen /home/kavang/Desktop/photogod/build/photogod --selftest --shot=shot3a.png)",
+      "Bash(echo \"no-image rc=$?\")",
+      "Bash(git rm *)",
+      "Bash(magick resources/appicon/icon_16.png resources/appicon/icon_32.png resources/appicon/icon_48.png resources/appicon/icon_64.png resources/appicon/icon_128.png resources/appicon/icon_256.png resources/icons/app-icon.ico)",
+      "Bash(timeout 3 ./build/photogod --selftest --shot=/tmp/claude-1000/-home-kavang-Desktop-photogod/0726bbe7-bb88-4b12-88e2-5485b6b21675/scratchpad/ui.png)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(git add *)"
     ]
   }
 }

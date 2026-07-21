@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt6 and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev qt6-svg-dev cmake ninja-build \
+            libgl1-mesa-dev fuse libfuse2
+
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          ninja -C build
+
+      - name: Install to AppDir
+        run: |
+          cmake --install build --prefix AppDir/usr
+
+      - name: Build AppImage
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir \
+            -d resources/photogod.desktop \
+            -i resources/appicon/icon_256.png \
+            --output appimage
+          mv PhotoGod*.AppImage photogod-linux-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photogod-linux
+          path: photogod-linux-x86_64.AppImage
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.7.*"
+          modules: "qtsvg"
+
+      - name: Configure & build
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+
+      - name: windeployqt
+        shell: bash
+        run: |
+          windeployqt --release build/photogod.exe
+
+      - name: Package zip
+        shell: bash
+        run: |
+          mkdir dist
+          cp -r build/photogod.exe build/*.dll build/platforms build/styles build/imageformats dist/ 2>/dev/null || true
+          cp build/photogod.exe dist/ 2>/dev/null || true
+          powershell Compress-Archive -Path dist/* -DestinationPath photogod-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photogod-windows
+          path: photogod-windows-x86_64.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.7.*"
+          modules: "qtsvg"
+
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+
+      - name: macdeployqt
+        run: |
+          macdeployqt build/photogod.app
+
+      - name: Build DMG
+        run: |
+          hdiutil create -volname PhotoGod -srcfolder build/photogod.app \
+            -ov -format UDZO photogod-macos.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photogod-macos
+          path: photogod-macos.dmg
+
+  release:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/photogod-linux/*.AppImage
+            artifacts/photogod-windows/*.zip
+            artifacts/photogod-macos/*.dmg

@@ -4,16 +4,20 @@
 #include <QMainWindow>
 #include <QUndoGroup>
 #include <QHash>
+#include <functional>
 
 class Canvas;
 class LayersPanel;
 class ColorPanel;
 class PropertiesPanel;
+class BrushesPanel;
+class AdjustmentsPanel;
 class QTabWidget;
 class QStackedWidget;
 class QLabel;
 class QSlider;
 class QActionGroup;
+class QDockWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -61,10 +65,14 @@ private:
     LayersPanel* m_layers;
     ColorPanel* m_color;
     PropertiesPanel* m_props;
+    BrushesPanel* m_brushes;
+    AdjustmentsPanel* m_adjust;
+    QDockWidget* m_dockProps = nullptr;
 
     QStackedWidget* m_optStack;
     QHash<int, QAction*> m_toolActions;   // key: int(ToolType)
     QSlider* m_brushSizeSlider = nullptr;
+    QList<std::function<void()>> m_optionSync;   // refresh option widgets from m_ts
 
     QLabel *m_statusPos, *m_statusZoom, *m_statusSize;
 };

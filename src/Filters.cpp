@@ -173,6 +173,12 @@ static void boxBlurPremult(QImage& img, int radius)
     }
 }
 
+void gaussianBlurPremult(QImage& img, int radius)
+{
+    img = img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    boxBlurPremult(img, std::max(1, radius / 2));
+}
+
 void applyFilter(QImage& img, FilterType t, const FilterParams& p)
 {
     if (img.isNull()) return;

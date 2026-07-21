@@ -1,5 +1,0 @@
-/home/kavang/Desktop/photogod/build/CMakeFiles/photogod.dir
-/home/kavang/Desktop/photogod/build/CMakeFiles/edit_cache.dir
-/home/kavang/Desktop/photogod/build/CMakeFiles/rebuild_cache.dir
-/home/kavang/Desktop/photogod/build/CMakeFiles/photogod_autogen_timestamp_deps.dir
-/home/kavang/Desktop/photogod/build/CMakeFiles/photogod_autogen.dir

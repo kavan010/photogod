@@ -8,8 +8,11 @@
 #include <QTabletEvent>
 #include <QRadialGradient>
 #include <QLinearGradient>
+#include <QRandomGenerator>
 #include <QtMath>
 #include <vector>
+
+static constexpr int kRuler = 22;   // ruler strip thickness in widget px
 
 Canvas::Canvas(Document* doc, ToolSettings* ts, QWidget* parent)
     : QWidget(parent), m_doc(doc), m_ts(ts)
@@ -58,7 +61,8 @@ void Canvas::updateCursor()
     case ToolType::Zoom:      setCursor(Qt::PointingHandCursor); break;
     case ToolType::Text:      setCursor(Qt::IBeamCursor); break;
     case ToolType::Brush:
-    case ToolType::Eraser:    setCursor(Qt::BlankCursor); break;
+    case ToolType::Eraser:
+    case ToolType::Blur:      setCursor(Qt::BlankCursor); break;
     default:                  setCursor(Qt::CrossCursor); break;
     }
 }
@@ -240,8 +244,14 @@ void Canvas::paintEvent(QPaintEvent*)
                    "Transform: drag=move, corners=scale (Shift=uniform), outside=rotate, Enter=apply, Esc=cancel");
     }
 
+    // rulers + guides
+    if (m_ts->showRulers)
+        drawRulersAndGuides(p);
+
     // brush outline cursor
-    if ((m_tool == ToolType::Brush || m_tool == ToolType::Eraser) && m_haveHover && !m_spaceDown) {
+    if ((m_tool == ToolType::Brush || m_tool == ToolType::Eraser || m_tool == ToolType::Blur)
+        && m_haveHover && !m_spaceDown) {
+        p.setRenderHint(QPainter::Antialiasing, true);
         double r = m_ts->brushSize / 2.0 * m_zoom;
         p.setBrush(Qt::NoBrush);
         p.setPen(QPen(Qt::black, 1));
@@ -275,15 +285,31 @@ void Canvas::rebuildStamp(double radius, double flow, const QColor& color, doubl
     p.setPen(Qt::NoPen);
     p.setBrush(g);
     p.drawEllipse(c, radius, radius);
+    p.end();
+
+    if (m_ts->brushNoise > 0) {
+        double n = m_ts->brushNoise / 100.0;
+        auto* rng = QRandomGenerator::global();
+        for (int y = 0; y < m_stamp.height(); ++y) {
+            QRgb* line = reinterpret_cast<QRgb*>(m_stamp.scanLine(y));
+            for (int x = 0; x < m_stamp.width(); ++x) {
+                if (qAlpha(line[x]) == 0) continue;
+                double f = 1.0 - n * rng->generateDouble();
+                line[x] = qRgba(int(qRed(line[x]) * f), int(qGreen(line[x]) * f),
+                                int(qBlue(line[x]) * f), int(qAlpha(line[x]) * f));
+            }
+        }
+    }
     m_stampRadius = radius;
     m_stampFlow = flow;
 }
 
-bool Canvas::beginStroke(const QPointF& docPos, bool erase)
+bool Canvas::beginStroke(const QPointF& docPos, bool erase, bool blur)
 {
     auto l = m_doc->activeLayer();
     if (!l) return false;
     m_strokeOnMask = m_doc->maskEditing && l->hasMask();
+    if (blur && m_strokeOnMask) m_strokeOnMask = false;   // blur always works on pixels
     if (!m_strokeOnMask) {
         if (!l->isPaintable()) {
             emit statusMessage("Cannot paint on an adjustment layer (paint on its mask instead)");
@@ -296,10 +322,16 @@ bool Canvas::beginStroke(const QPointF& docPos, bool erase)
     }
     m_strokeLayer = l;
     m_strokeErase = erase;
+    m_strokeBlur = blur;
     m_preState = LayerState::capture(*l);
     if (!m_strokeOnMask) {
         l->ensureArea(m_doc->rect());
         m_strokeBase = l->image;
+        if (blur) {
+            m_blurSource = m_strokeBase;
+            m_blurSource.detach();
+            gaussianBlurPremult(m_blurSource, m_ts->blurRadius);
+        }
     } else {
         m_strokeBaseMask = l->mask;
         m_strokeBaseMask.detach();
@@ -318,10 +350,11 @@ void Canvas::stampAt(const QPointF& docPos)
     double r = m_ts->brushSize / 2.0 * (m_ts->pressureSize ? m_pressure : 1.0);
     r = std::max(0.5, r);
     double flow = m_ts->brushFlow / 100.0 * (m_ts->pressureOpacity ? m_pressure : 1.0);
-    QColor col = m_strokeErase ? QColor(Qt::white) : m_ts->fg;
+    QColor col = (m_strokeErase || m_strokeBlur) ? QColor(Qt::white) : m_ts->fg;
     if (m_strokeOnMask && m_strokeErase) col = Qt::black;
 
-    if (std::abs(r - m_stampRadius) > 0.4 || std::abs(flow - m_stampFlow) > 0.03)
+    if (std::abs(r - m_stampRadius) > 0.4 || std::abs(flow - m_stampFlow) > 0.03
+        || m_ts->brushNoise > 0)   // regenerate grain per stamp
         rebuildStamp(r, flow, col, m_ts->brushHardness / 100.0);
 
     QPointF tl = docPos - QPointF(m_stamp.width() / 2.0, m_stamp.height() / 2.0);
@@ -391,10 +424,22 @@ void Canvas::applyStrokeRegion(QRect r)
         QPainter p(&l->image);
         p.setCompositionMode(QPainter::CompositionMode_Source);
         p.drawImage(rl.topLeft(), m_strokeBase, rl);
-        p.setCompositionMode(m_strokeErase ? QPainter::CompositionMode_DestinationOut
-                                           : QPainter::CompositionMode_SourceOver);
-        p.setOpacity(op);
-        p.drawImage(rl.topLeft(), m_strokeBuf, r);
+        if (m_strokeBlur) {
+            // paint the pre-blurred layer through the stroke's alpha
+            QImage part = m_blurSource.copy(rl);
+            QPainter bp(&part);
+            bp.setCompositionMode(QPainter::CompositionMode_DestinationIn);
+            bp.drawImage(QPoint(0, 0), m_strokeBuf, r);
+            bp.end();
+            p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+            p.setOpacity(op);
+            p.drawImage(rl.topLeft(), part);
+        } else {
+            p.setCompositionMode(m_strokeErase ? QPainter::CompositionMode_DestinationOut
+                                               : QPainter::CompositionMode_SourceOver);
+            p.setOpacity(op);
+            p.drawImage(rl.topLeft(), m_strokeBuf, r);
+        }
     }
 }
 
@@ -402,11 +447,13 @@ void Canvas::endStroke()
 {
     if (!m_strokeLayer) return;
     m_doc->undo.push(new LayerEditCommand(m_doc, m_strokeLayer, m_preState,
-                                          m_strokeErase ? "Eraser" : "Brush", m_strokeDirty));
+                                          m_strokeBlur ? "Blur" : m_strokeErase ? "Eraser" : "Brush",
+                                          m_strokeDirty));
     m_strokeLayer.reset();
     m_strokeBuf = QImage();
     m_strokeBase = QImage();
     m_strokeBaseMask = QImage();
+    m_blurSource = QImage();
     m_doc->invalidate();
 }
 
@@ -686,6 +733,137 @@ void Canvas::cancelTransform()
     update();
 }
 
+// ============================ rulers / guides / snapping ============================
+
+QList<double> Canvas::snapTargetsX() const
+{
+    QList<double> t = m_doc->guidesV;
+    t << 0 << m_doc->width() << m_doc->width() / 2.0;
+    return t;
+}
+
+QList<double> Canvas::snapTargetsY() const
+{
+    QList<double> t = m_doc->guidesH;
+    t << 0 << m_doc->height() << m_doc->height() / 2.0;
+    return t;
+}
+
+double Canvas::snap1D(double v, const QList<double>& targets, double tol) const
+{
+    double best = v, bd = tol;
+    for (double t : targets) {
+        double d = std::abs(t - v);
+        if (d < bd) { bd = d; best = t; }
+    }
+    return best;
+}
+
+QPointF Canvas::snapPoint(const QPointF& p) const
+{
+    if (!m_ts->snapping) return p;
+    double tol = 8.0 / m_zoom;
+    return QPointF(snap1D(p.x(), snapTargetsX(), tol), snap1D(p.y(), snapTargetsY(), tol));
+}
+
+QPoint Canvas::snapMoveOffset(QPoint offset, const QSize& size) const
+{
+    if (!m_ts->snapping) return offset;
+    double tol = 8.0 / m_zoom;
+    auto bestDelta = [&](double e0, double e1, double ec, const QList<double>& targets) {
+        double best = tol;
+        double delta = 0;
+        for (double edge : {e0, e1, ec}) {
+            for (double t : targets) {
+                double d = t - edge;
+                if (std::abs(d) < std::abs(best)) { best = std::abs(d); delta = d; }
+            }
+        }
+        return delta;
+    };
+    double dx = bestDelta(offset.x(), offset.x() + size.width(),
+                          offset.x() + size.width() / 2.0, snapTargetsX());
+    double dy = bestDelta(offset.y(), offset.y() + size.height(),
+                          offset.y() + size.height() / 2.0, snapTargetsY());
+    return offset + QPoint(int(std::lround(dx)), int(std::lround(dy)));
+}
+
+void Canvas::drawRulersAndGuides(QPainter& p)
+{
+    // guides
+    p.setRenderHint(QPainter::Antialiasing, false);
+    p.setPen(QColor(0, 200, 220));
+    for (double g : m_doc->guidesV) {
+        int x = int(std::lround(docToWidget(QPointF(g, 0)).x()));
+        p.drawLine(x, 0, x, height());
+    }
+    for (double g : m_doc->guidesH) {
+        int y = int(std::lround(docToWidget(QPointF(0, g)).y()));
+        p.drawLine(0, y, width(), y);
+    }
+    if (m_act == Act::GuideDrag) {
+        p.setPen(QPen(QColor(80, 230, 255), 2));
+        if (m_guideOrient == 0) {
+            int y = int(std::lround(docToWidget(QPointF(0, m_guideVal)).y()));
+            p.drawLine(0, y, width(), y);
+        } else {
+            int x = int(std::lround(docToWidget(QPointF(m_guideVal, 0)).x()));
+            p.drawLine(x, 0, x, height());
+        }
+    }
+
+    // ruler strips
+    QColor strip(28, 28, 31), tick(120, 120, 125), label(160, 160, 165);
+    p.fillRect(QRect(0, 0, width(), kRuler), strip);
+    p.fillRect(QRect(0, 0, kRuler, height()), strip);
+    p.setPen(QColor(60, 60, 65));
+    p.drawLine(0, kRuler, width(), kRuler);
+    p.drawLine(kRuler, 0, kRuler, height());
+
+    static const double steps[] = {1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+    double step = 10000;
+    for (double s : steps)
+        if (s * m_zoom >= 55) { step = s; break; }
+
+    QFont f = p.font();
+    f.setPixelSize(9);
+    p.setFont(f);
+
+    // horizontal ruler
+    double x0 = widgetToDoc(QPointF(kRuler, 0)).x();
+    double x1 = widgetToDoc(QPointF(width(), 0)).x();
+    for (double v = std::floor(x0 / step) * step; v <= x1; v += step) {
+        int wx = int(std::lround(docToWidget(QPointF(v, 0)).x()));
+        if (wx < kRuler) continue;
+        p.setPen(tick);
+        p.drawLine(wx, kRuler - 7, wx, kRuler);
+        p.setPen(label);
+        p.drawText(wx + 3, kRuler - 9, QString::number(v));
+        int half = int(std::lround(docToWidget(QPointF(v + step / 2, 0)).x()));
+        p.setPen(tick);
+        if (half >= kRuler) p.drawLine(half, kRuler - 4, half, kRuler);
+    }
+    // vertical ruler
+    double y0 = widgetToDoc(QPointF(0, kRuler)).y();
+    double y1 = widgetToDoc(QPointF(0, height())).y();
+    for (double v = std::floor(y0 / step) * step; v <= y1; v += step) {
+        int wy = int(std::lround(docToWidget(QPointF(0, v)).y()));
+        if (wy < kRuler) continue;
+        p.setPen(tick);
+        p.drawLine(kRuler - 7, wy, kRuler, wy);
+        p.save();
+        p.setPen(label);
+        p.translate(kRuler - 10, wy + 3);
+        p.rotate(90);
+        p.drawText(0, 0, QString::number(v));
+        p.restore();
+        int half = int(std::lround(docToWidget(QPointF(0, v + step / 2)).y()));
+        p.setPen(tick);
+        if (half >= kRuler) p.drawLine(kRuler - 4, half, kRuler, half);
+    }
+    p.fillRect(QRect(0, 0, kRuler, kRuler), strip);
+}
+
 // ============================ events ============================
 
 void Canvas::mousePressEvent(QMouseEvent* e)
@@ -703,6 +881,42 @@ void Canvas::mousePressEvent(QMouseEvent* e)
         return;
     }
     if (e->button() != Qt::LeftButton) return;
+
+    // rulers: drag out a new guide
+    if (m_ts->showRulers && !m_xf.active) {
+        bool inTop = wp.y() < kRuler, inLeft = wp.x() < kRuler;
+        if (inTop || inLeft) {
+            m_act = Act::GuideDrag;
+            m_guideOrient = (inLeft && !inTop) ? 1 : 0;
+            if (inTop && inLeft) m_guideOrient = 0;
+            m_guideIndex = -1;
+            m_guideVal = m_guideOrient == 0 ? dp.y() : dp.x();
+            update();
+            return;
+        }
+        // move tool grabs existing guides
+        if (m_tool == ToolType::Move) {
+            double tol = 5.0 / m_zoom;
+            for (int i = 0; i < m_doc->guidesH.size(); ++i) {
+                if (std::abs(dp.y() - m_doc->guidesH[i]) < tol) {
+                    m_act = Act::GuideDrag;
+                    m_guideOrient = 0;
+                    m_guideIndex = i;
+                    m_guideVal = m_doc->guidesH[i];
+                    return;
+                }
+            }
+            for (int i = 0; i < m_doc->guidesV.size(); ++i) {
+                if (std::abs(dp.x() - m_doc->guidesV[i]) < tol) {
+                    m_act = Act::GuideDrag;
+                    m_guideOrient = 1;
+                    m_guideIndex = i;
+                    m_guideVal = m_doc->guidesV[i];
+                    return;
+                }
+            }
+        }
+    }
 
     // transform mode captures all clicks
     if (m_xf.active) {
@@ -736,26 +950,35 @@ void Canvas::mousePressEvent(QMouseEvent* e)
     switch (m_tool) {
     case ToolType::Move: {
         auto l = m_doc->activeLayer();
-        if (l && !l->locked) {
-            m_moveStartOffset = l->offset;
-            m_preState = LayerState::capture(*l);
-            m_act = Act::MoveLayer;
+        if (l && !l->locked && !l->image.isNull()) {
+            // only grab the layer if the cursor is on one of its actual pixels
+            QPoint pl = dp.toPoint() - l->offset;
+            bool hit = l->image.rect().contains(pl) && qAlpha(l->image.pixel(pl)) > 8;
+            if (hit) {
+                m_moveStartOffset = l->offset;
+                m_preState = LayerState::capture(*l);
+                m_act = Act::MoveLayer;
+            } else {
+                emit statusMessage("Click on the layer's pixels to move it");
+            }
         }
         break;
     }
     case ToolType::Brush:
     case ToolType::Eraser:
+    case ToolType::Blur:
         if (e->modifiers() & Qt::AltModifier) {
             pickColor(dp);
             break;
         }
-        if (beginStroke(dp, m_tool == ToolType::Eraser)) {
+        if (beginStroke(dp, m_tool == ToolType::Eraser, m_tool == ToolType::Blur)) {
             m_act = Act::Stroke;
             m_doc->invalidate();
         }
         break;
     case ToolType::MarqueeRect:
     case ToolType::MarqueeEllipse:
+        m_dragStartDoc = m_dragCurDoc = snapPoint(dp);
         m_act = Act::Marquee;
         break;
     case ToolType::Lasso:
@@ -767,6 +990,7 @@ void Canvas::mousePressEvent(QMouseEvent* e)
         wandSelect(dp.toPoint());
         break;
     case ToolType::Crop:
+        m_dragStartDoc = m_dragCurDoc = snapPoint(dp);
         m_act = Act::CropDrag;
         m_cropValid = false;
         break;
@@ -779,6 +1003,7 @@ void Canvas::mousePressEvent(QMouseEvent* e)
     case ToolType::ShapeRect:
     case ToolType::ShapeEllipse:
     case ToolType::ShapeLine:
+        m_dragStartDoc = m_dragCurDoc = snapPoint(dp);
         m_act = Act::ShapeDrag;
         break;
     case ToolType::Text:
@@ -811,15 +1036,19 @@ void Canvas::mouseMoveEvent(QMouseEvent* e)
     case Act::MoveLayer: {
         auto l = m_doc->activeLayer();
         if (l) {
-            l->offset = m_moveStartOffset + (dp - m_dragStartDoc).toPoint();
+            QPoint off = m_moveStartOffset + (dp - m_dragStartDoc).toPoint();
+            l->offset = snapMoveOffset(off, l->image.size());
             m_doc->invalidate();
         }
         break;
     }
+    case Act::GuideDrag:
+        m_guideVal = m_guideOrient == 0 ? dp.y() : dp.x();
+        break;
     case Act::Marquee:
     case Act::ShapeDrag:
     case Act::GradDrag:
-        m_dragCurDoc = dp;
+        m_dragCurDoc = snapPoint(dp);
         if (m_act == Act::Marquee && (e->modifiers() & Qt::ControlModifier)) {
             // ctrl = square/circle constraint
             QPointF d = dp - m_dragStartDoc;
@@ -832,7 +1061,7 @@ void Canvas::mouseMoveEvent(QMouseEvent* e)
             m_lassoPts << dp;
         break;
     case Act::CropDrag:
-        m_dragCurDoc = dp;
+        m_dragCurDoc = snapPoint(dp);
         m_cropRect = QRectF(m_dragStartDoc, m_dragCurDoc).normalized()
                          .intersected(QRectF(m_doc->rect()));
         m_cropValid = m_cropRect.width() > 2 && m_cropRect.height() > 2;
@@ -935,7 +1164,8 @@ void Canvas::mouseReleaseEvent(QMouseEvent* e)
         break;
     }
     case Act::ShapeDrag: {
-        QRectF r = QRectF(m_dragStartDoc, dp).normalized();
+        QPointF end = m_dragCurDoc;
+        QRectF r = QRectF(m_dragStartDoc, end).normalized();
         QImage buf(m_doc->size(), QImage::Format_ARGB32_Premultiplied);
         buf.fill(Qt::transparent);
         QPainter p(&buf);
@@ -943,7 +1173,7 @@ void Canvas::mouseReleaseEvent(QMouseEvent* e)
         QPen pen(m_ts->bg, m_ts->shapeStrokeWidth);
         if (m_tool == ToolType::ShapeLine) {
             p.setPen(QPen(m_ts->fg, std::max(1, m_ts->shapeStrokeWidth)));
-            p.drawLine(m_dragStartDoc, dp);
+            p.drawLine(m_dragStartDoc, end);
         } else {
             p.setPen(m_ts->shapeStroke ? pen : QPen(Qt::NoPen));
             p.setBrush(m_ts->shapeFill ? QBrush(m_ts->fg) : QBrush(Qt::NoBrush));
@@ -957,10 +1187,10 @@ void Canvas::mouseReleaseEvent(QMouseEvent* e)
         break;
     }
     case Act::GradDrag: {
-        if (QLineF(m_dragStartDoc, dp).length() > 2) {
+        if (QLineF(m_dragStartDoc, m_dragCurDoc).length() > 2) {
             QImage buf(m_doc->size(), QImage::Format_ARGB32_Premultiplied);
             buf.fill(Qt::transparent);
-            QLinearGradient g(m_dragStartDoc, dp);
+            QLinearGradient g(m_dragStartDoc, m_dragCurDoc);
             g.setColorAt(0, m_ts->fg);
             if (m_ts->gradientMode == 1) {
                 QColor end = m_ts->fg;
@@ -978,6 +1208,20 @@ void Canvas::mouseReleaseEvent(QMouseEvent* e)
     }
     case Act::CropDrag:
         break;
+    case Act::GuideDrag: {
+        QPointF wp = e->position();
+        bool onRuler = m_guideOrient == 0 ? wp.y() < kRuler : wp.x() < kRuler;
+        double val = std::round(m_guideOrient == 0 ? dp.y() : dp.x());
+        bool inDoc = m_guideOrient == 0 ? (val >= 0 && val <= m_doc->height())
+                                        : (val >= 0 && val <= m_doc->width());
+        auto& list = m_guideOrient == 0 ? m_doc->guidesH : m_doc->guidesV;
+        if (m_guideIndex >= 0 && m_guideIndex < list.size())
+            list.removeAt(m_guideIndex);
+        if (!onRuler && inDoc)
+            list.append(val);
+        m_guideIndex = -1;
+        break;
+    }
     case Act::XformDrag:
         m_xf.dragMode = 0;
         break;
@@ -1028,6 +1272,12 @@ void Canvas::keyPressEvent(QKeyEvent* e)
     if (e->key() == Qt::Key_Escape) {
         if (m_xf.active) { cancelTransform(); return; }
         if (m_cropValid) { m_cropValid = false; update(); return; }
+    }
+    // fallback so Delete always clears the selection when the canvas has focus
+    if ((e->key() == Qt::Key_Delete || e->key() == Qt::Key_Backspace)
+        && e->modifiers() == Qt::NoModifier && m_doc->hasSelection() && !m_xf.active) {
+        clearSelectionArea();
+        return;
     }
     QWidget::keyPressEvent(e);
 }

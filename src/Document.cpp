@@ -308,6 +308,11 @@ bool Document::saveProject(const QString& path)
     root["height"] = m_size.height();
     root["active"] = activeIndex;
     root["name"] = name;
+    QJsonArray gh, gv;
+    for (double g : guidesH) gh.append(g);
+    for (double g : guidesV) gv.append(g);
+    root["guidesH"] = gh;
+    root["guidesV"] = gv;
 
     QJsonArray arr;
     for (const auto& l : layers) {
@@ -364,6 +369,8 @@ Document* Document::loadProject(const QString& path, QObject* parent)
     doc->layers.clear();
     doc->name = root["name"].toString("Untitled");
     doc->filePath = path;
+    for (const auto& v : root["guidesH"].toArray()) doc->guidesH.append(v.toDouble());
+    for (const auto& v : root["guidesV"].toArray()) doc->guidesV.append(v.toDouble());
 
     for (const auto& v : root["layers"].toArray()) {
         QJsonObject o = v.toObject();

@@ -1,0 +1,8 @@
+build/
+*.o
+*.obj
+.vscode/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+*.user

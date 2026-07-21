@@ -1,0 +1,26 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file alias="move.svg">icons/move.svg</file>
+    <file alias="marquee-rect.svg">icons/marquee-rect.svg</file>
+    <file alias="marquee-ellipse.svg">icons/marquee-ellipse.svg</file>
+    <file alias="lasso.svg">icons/lasso.svg</file>
+    <file alias="wand.svg">icons/wand.svg</file>
+    <file alias="crop.svg">icons/crop.svg</file>
+    <file alias="eyedropper.svg">icons/eyedropper.svg</file>
+    <file alias="brush.svg">icons/brush.svg</file>
+    <file alias="eraser.svg">icons/eraser.svg</file>
+    <file alias="gradient.svg">icons/gradient.svg</file>
+    <file alias="text.svg">icons/text.svg</file>
+    <file alias="shape-rect.svg">icons/shape-rect.svg</file>
+    <file alias="shape-ellipse.svg">icons/shape-ellipse.svg</file>
+    <file alias="shape-line.svg">icons/shape-line.svg</file>
+    <file alias="zoom.svg">icons/zoom.svg</file>
+    <file alias="hand.svg">icons/hand.svg</file>
+    <file alias="blur.svg">icons/blur.svg</file>
+    <file alias="eye.svg">icons/eye.svg</file>
+    <file alias="eye-off.svg">icons/eye-off.svg</file>
+    <file alias="lock.svg">icons/lock.svg</file>
+    <file alias="unlock.svg">icons/unlock.svg</file>
+    <file alias="ruler.svg">icons/ruler.svg</file>
+  </qresource>
+</RCC>

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PhotoGod
+Comment=Layer-based image editor
+Exec=photogod %f
+Icon=photogod
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=image/png;image/jpeg;image/bmp;image/gif;image/tiff;image/webp;

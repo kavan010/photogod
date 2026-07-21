@@ -30,6 +30,10 @@ public:
 
     QUndoStack undo;
 
+    // ruler guides (doc coords); not undoable, saved with the project
+    QList<double> guidesH;   // horizontal lines (y values)
+    QList<double> guidesV;   // vertical lines (x values)
+
     std::shared_ptr<Layer> activeLayer() const;
     void setActiveIndex(int i)
     {

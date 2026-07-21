@@ -3,6 +3,7 @@
 #include "Panels.h"
 #include "Dialogs.h"
 #include "Commands.h"
+#include <QDockWidget>
 #include <QTabWidget>
 #include <QToolBar>
 #include <QToolButton>
@@ -108,6 +109,12 @@ void MainWindow::addDocument(Document* doc)
         statusBar()->showMessage(m, 4000);
     });
     connect(&doc->undo, &QUndoStack::cleanChanged, this, [this, doc](bool) { updateTabTitle(doc); });
+    connect(doc, &Document::activeLayerChanged, this, [this, doc] {
+        if (doc != currentDoc() || !m_dockProps) return;
+        auto l = doc->activeLayer();
+        if (l && l->type == Layer::Adjustment)
+            m_dockProps->raise();
+    });
     connect(doc, &Document::structureChanged, this, [this, doc] {
         if (doc == currentDoc())
             m_statusSize->setText(QString("%1 x %2").arg(doc->width()).arg(doc->height()));
@@ -422,8 +429,9 @@ void MainWindow::buildToolbar()
     auto* group = new QActionGroup(this);
     group->setExclusive(true);
 
-    auto addTool = [&](ToolType t, const QString& label, const QString& name, const QString& shortcut) {
-        auto* a = new QAction(label, this);
+    auto addTool = [&](ToolType t, const QString& iconName, const QString& name, const QString& shortcut) {
+        auto* a = new QAction(name, this);
+        a->setIcon(QIcon(QString(":/icons/%1.svg").arg(iconName)));
         a->setCheckable(true);
         a->setToolTip(name + (shortcut.isEmpty() ? "" : " (" + shortcut + ")"));
         if (!shortcut.isEmpty()) a->setShortcut(QKeySequence(shortcut));
@@ -434,25 +442,26 @@ void MainWindow::buildToolbar()
         return a;
     };
 
-    addTool(ToolType::Move, "V", "Move", "V");
-    addTool(ToolType::MarqueeRect, "▭", "Rectangular marquee — Shift adds, Alt subtracts, Ctrl-drag square", "");
-    addTool(ToolType::MarqueeEllipse, "◯", "Elliptical marquee (press M to toggle)", "");
-    addTool(ToolType::Lasso, "L", "Polygon lasso selection", "L");
-    addTool(ToolType::Wand, "W", "Magic wand", "W");
-    addTool(ToolType::Crop, "C", "Crop — drag then Enter", "C");
-    addTool(ToolType::Eyedropper, "I", "Eyedropper", "I");
+    addTool(ToolType::Move, "move", "Move", "V");
+    addTool(ToolType::MarqueeRect, "marquee-rect", "Rectangular marquee — Shift adds, Alt subtracts, Ctrl-drag square", "");
+    addTool(ToolType::MarqueeEllipse, "marquee-ellipse", "Elliptical marquee (press M to toggle)", "");
+    addTool(ToolType::Lasso, "lasso", "Polygon lasso selection", "L");
+    addTool(ToolType::Wand, "wand", "Magic wand", "W");
+    addTool(ToolType::Crop, "crop", "Crop — drag then Enter", "C");
+    addTool(ToolType::Eyedropper, "eyedropper", "Eyedropper", "I");
     tb->addSeparator();
-    addTool(ToolType::Brush, "B", "Brush", "B");
-    addTool(ToolType::Eraser, "E", "Eraser", "E");
-    addTool(ToolType::Gradient, "G", "Gradient", "G");
-    addTool(ToolType::Text, "T", "Text — click canvas", "T");
+    addTool(ToolType::Brush, "brush", "Brush", "B");
+    addTool(ToolType::Eraser, "eraser", "Eraser", "E");
+    addTool(ToolType::Blur, "blur", "Blur brush (gaussian)", "R");
+    addTool(ToolType::Gradient, "gradient", "Gradient", "G");
+    addTool(ToolType::Text, "text", "Text — click canvas", "T");
     tb->addSeparator();
-    addTool(ToolType::ShapeRect, "▬", "Rectangle shape (press U to cycle shapes)", "");
-    addTool(ToolType::ShapeEllipse, "●", "Ellipse shape", "");
-    addTool(ToolType::ShapeLine, "╱", "Line shape", "");
+    addTool(ToolType::ShapeRect, "shape-rect", "Rectangle shape (press U to cycle shapes)", "");
+    addTool(ToolType::ShapeEllipse, "shape-ellipse", "Ellipse shape", "");
+    addTool(ToolType::ShapeLine, "shape-line", "Line shape", "");
     tb->addSeparator();
-    addTool(ToolType::Zoom, "Z", "Zoom — click to zoom in, Alt-click out", "Z");
-    addTool(ToolType::Hand, "H", "Hand (pan) — or hold Space", "H");
+    addTool(ToolType::Zoom, "zoom", "Zoom — click to zoom in, Alt-click out", "Z");
+    addTool(ToolType::Hand, "hand", "Hand (pan) — or hold Space", "H");
 
     m_toolActions[int(ToolType::Move)]->setChecked(true);
 
@@ -503,6 +512,7 @@ void MainWindow::setTool(ToolType t)
     if (auto* a = m_toolActions.value(int(t)); a && !a->isChecked())
         a->setChecked(true);
     m_optStack->setCurrentIndex(pageForTool(t));
+    for (const auto& sync : m_optionSync) sync();
     if (Canvas* c = currentCanvas()) {
         c->setTool(t);
         c->setFocus();
@@ -522,6 +532,7 @@ int MainWindow::pageForTool(ToolType t) const
     case ToolType::ShapeLine:    return 3;
     case ToolType::Gradient:     return 4;
     case ToolType::Text:         return 5;
+    case ToolType::Blur:         return 6;
     default:                     return 0;
     }
 }
@@ -552,34 +563,44 @@ void MainWindow::buildOptionsBar()
         lay->addWidget(new QLabel("Wheel = zoom · Space-drag / middle-drag = pan · Shift adds to selection, Alt subtracts"));
         lay->addStretch();
     }
+    // sliders that mirror a ToolSettings field and stay in sync across pages
+    auto addSyncSlider = [this](QHBoxLayout* lay, const QString& label, int min, int max,
+                                std::function<int()> getter, std::function<void(int)> setter) {
+        lay->addWidget(new QLabel(label));
+        auto* s = new QSlider(Qt::Horizontal);
+        s->setRange(min, max);
+        s->setValue(getter());
+        s->setFixedWidth(110);
+        auto* num = new QLabel(QString::number(getter()));
+        num->setMinimumWidth(28);
+        connect(s, &QSlider::valueChanged, this, [setter, num](int v) {
+            num->setText(QString::number(v));
+            setter(v);
+        });
+        lay->addWidget(s);
+        lay->addWidget(num);
+        m_optionSync << [s, getter] { s->setValue(getter()); };
+        return s;
+    };
+
     // page 1: brush / eraser
     {
         auto* lay = mkPage();
-        auto addSlider = [&](const QString& label, int min, int max, int val,
-                             std::function<void(int)> setter) {
-            lay->addWidget(new QLabel(label));
-            auto* s = new QSlider(Qt::Horizontal);
-            s->setRange(min, max);
-            s->setValue(val);
-            s->setFixedWidth(110);
-            auto* num = new QLabel(QString::number(val));
-            num->setMinimumWidth(28);
-            connect(s, &QSlider::valueChanged, this, [setter, num](int v) {
-                num->setText(QString::number(v));
-                setter(v);
+        m_brushSizeSlider = addSyncSlider(lay, "Size", 1, 500,
+            [this] { return m_ts.brushSize; },
+            [this](int v) {
+                m_ts.brushSize = v;
+                if (Canvas* c = currentCanvas()) c->update();
             });
-            lay->addWidget(s);
-            lay->addWidget(num);
-            return s;
-        };
-        m_brushSizeSlider = addSlider("Size", 1, 500, m_ts.brushSize, [this](int v) {
-            m_ts.brushSize = v;
-            if (Canvas* c = currentCanvas()) c->update();
-        });
-        addSlider("Opacity", 1, 100, m_ts.brushOpacity, [this](int v) { m_ts.brushOpacity = v; });
-        addSlider("Flow", 1, 100, m_ts.brushFlow, [this](int v) { m_ts.brushFlow = v; });
-        addSlider("Hardness", 0, 100, m_ts.brushHardness, [this](int v) { m_ts.brushHardness = v; });
-        auto* pSize = new QCheckBox("Pen pressure → size");
+        addSyncSlider(lay, "Opacity", 1, 100, [this] { return m_ts.brushOpacity; },
+                      [this](int v) { m_ts.brushOpacity = v; });
+        addSyncSlider(lay, "Flow", 1, 100, [this] { return m_ts.brushFlow; },
+                      [this](int v) { m_ts.brushFlow = v; });
+        addSyncSlider(lay, "Hardness", 0, 100, [this] { return m_ts.brushHardness; },
+                      [this](int v) { m_ts.brushHardness = v; });
+        addSyncSlider(lay, "Grain", 0, 100, [this] { return m_ts.brushNoise; },
+                      [this](int v) { m_ts.brushNoise = v; });
+        auto* pSize = new QCheckBox("Pressure → size");
         pSize->setChecked(m_ts.pressureSize);
         connect(pSize, &QCheckBox::toggled, this, [this](bool b) { m_ts.pressureSize = b; });
         auto* pOp = new QCheckBox("→ opacity");
@@ -657,6 +678,41 @@ void MainWindow::buildOptionsBar()
         lay->addWidget(new QLabel("Click the canvas to add text; click existing text to edit"));
         lay->addStretch();
     }
+    // page 6: blur brush
+    {
+        auto* lay = mkPage();
+        addSyncSlider(lay, "Size", 1, 500,
+            [this] { return m_ts.brushSize; },
+            [this](int v) {
+                m_ts.brushSize = v;
+                if (Canvas* c = currentCanvas()) c->update();
+            });
+        addSyncSlider(lay, "Strength", 1, 100, [this] { return m_ts.brushOpacity; },
+                      [this](int v) { m_ts.brushOpacity = v; });
+        addSyncSlider(lay, "Blur radius", 1, 60, [this] { return m_ts.blurRadius; },
+                      [this](int v) { m_ts.blurRadius = v; });
+        lay->addWidget(new QLabel("Paint over areas to blur them"));
+        lay->addStretch();
+    }
+
+    // right corner: rulers / snapping toggles
+    auto* rulersBtn = new QAction(QIcon(":/icons/ruler.svg"), "Rulers && Guides", this);
+    rulersBtn->setCheckable(true);
+    rulersBtn->setChecked(m_ts.showRulers);
+    rulersBtn->setToolTip("Show rulers and guides — drag out of a ruler to create a guide,\n"
+                          "drag a guide back to the ruler to remove it (Move tool)");
+    connect(rulersBtn, &QAction::triggered, this, [this](bool on) {
+        m_ts.showRulers = on;
+        if (Canvas* c = currentCanvas()) c->update();
+    });
+    auto* snapBtn = new QAction("Snap", this);
+    snapBtn->setCheckable(true);
+    snapBtn->setChecked(m_ts.snapping);
+    snapBtn->setToolTip("Snap moves/selections/crops to guides and canvas edges/center");
+    connect(snapBtn, &QAction::triggered, this, [this](bool on) { m_ts.snapping = on; });
+
+    bar->addAction(rulersBtn);
+    bar->addAction(snapBtn);
 }
 
 // ============================ docks ============================
@@ -667,7 +723,8 @@ void MainWindow::buildDocks()
         auto* d = new QDockWidget(title);
         d->setObjectName(title);
         d->setWidget(w);
-        d->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetClosable);
+        d->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetClosable
+                       | QDockWidget::DockWidgetFloatable);
         addDockWidget(area, d);
         return d;
     };
@@ -675,16 +732,40 @@ void MainWindow::buildDocks()
     m_color = new ColorPanel(&m_ts);
     m_props = new PropertiesPanel;
     m_layers = new LayersPanel;
+    m_brushes = new BrushesPanel(&m_ts);
+    m_adjust = new AdjustmentsPanel;
     auto* history = new QUndoView(&m_undoGroup);
     history->setEmptyLabel("<empty history>");
 
+    connect(m_brushes, &BrushesPanel::presetChosen, this, [this] {
+        setTool(ToolType::Brush);
+        statusBar()->showMessage("Brush preset applied", 2000);
+    });
+    connect(m_adjust, &AdjustmentsPanel::requestAdjustment, this, [this](FilterType t) {
+        Document* doc = currentDoc();
+        if (!doc) { statusBar()->showMessage("Open a document first", 3000); return; }
+        auto l = Layer::makeAdjustment(t);
+        if (t == FilterType::Grayscale) l->name = "Black & White";
+        doc->undo.push(new AddLayerCommand(doc, l, doc->activeIndex + 1, "New Adjustment"));
+        if (m_dockProps) m_dockProps->raise();
+    });
+
     auto* dColor = mkDock("Color", m_color, Qt::RightDockWidgetArea);
-    auto* dProps = mkDock("Properties", m_props, Qt::RightDockWidgetArea);
+    auto* dBrushes = mkDock("Brushes", m_brushes, Qt::RightDockWidgetArea);
     auto* dLayers = mkDock("Layers", m_layers, Qt::RightDockWidgetArea);
+    auto* dProps = mkDock("Properties", m_props, Qt::RightDockWidgetArea);
+    auto* dAdjust = mkDock("Adjustments", m_adjust, Qt::RightDockWidgetArea);
     auto* dHistory = mkDock("History", history, Qt::RightDockWidgetArea);
-    tabifyDockWidget(dProps, dHistory);
-    dProps->raise();
-    resizeDocks({dColor, dProps, dLayers}, {150, 170, 320}, Qt::Vertical);
+    m_dockProps = dProps;
+
+    // middle group: Brushes / Properties / Adjustments share one slot
+    tabifyDockWidget(dBrushes, dProps);
+    tabifyDockWidget(dProps, dAdjust);
+    dBrushes->raise();
+    // bottom group: Layers / History
+    tabifyDockWidget(dLayers, dHistory);
+    dLayers->raise();
+    resizeDocks({dColor, dBrushes, dLayers}, {230, 190, 320}, Qt::Vertical);
 }
 
 // ============================ menus ============================
@@ -890,10 +971,22 @@ void MainWindow::buildMenus()
         else showFullScreen();
     });
     fs->setCheckable(true);
-    view->addSeparator();
-    // dock toggles are added in buildDocks order
+
+    // ---- Window ----
+    QMenu* window = menuBar()->addMenu("&Window");
     for (QDockWidget* d : findChildren<QDockWidget*>())
-        view->addAction(d->toggleViewAction());
+        window->addAction(d->toggleViewAction());
+    window->addSeparator();
+    window->addAction("Show All Panels", this, [this] {
+        for (QDockWidget* d : findChildren<QDockWidget*>()) d->show();
+    });
+    window->addAction("Hide All Panels (Tab)", QKeySequence("Tab"), this, [this] {
+        bool anyVisible = false;
+        for (QDockWidget* d : findChildren<QDockWidget*>())
+            if (d->isVisible()) { anyVisible = true; break; }
+        for (QDockWidget* d : findChildren<QDockWidget*>())
+            d->setVisible(!anyVisible);
+    });
 
     // ---- Help ----
     QMenu* help = menuBar()->addMenu("&Help");

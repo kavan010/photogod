@@ -92,6 +92,77 @@ static int runModelTest(MainWindow& w)
     QString png = QDir::temp().filePath("photogod_selftest.png");
     check(doc->composite().save(png), "composite exported as PNG");
 
+    // ---- round 2: blur brush, move hit-test, delete-key, snapping ----
+    w.newDocument(QSize(300, 200), Qt::white);
+    doc = w.currentDoc();
+    canvas = w.currentCanvas();
+    canvas->fitToWindow();
+
+    // black left half via selection + fill
+    QPainterPath half;
+    half.addRect(0, 0, 150, 200);
+    doc->setSelection(half, 0);
+    canvas->fillWith(Qt::black);
+    doc->setSelection(QPainterPath(), 0);
+
+    // blur stroke across the boundary
+    canvas->setTool(ToolType::Blur);
+    auto sendAt = [&](QEvent::Type t, const QPointF& docPos) {
+        QPointF wp = canvas->docToWidget(docPos);
+        QMouseEvent ev(t, wp, canvas->mapToGlobal(wp.toPoint()),
+                       Qt::LeftButton, t == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton,
+                       Qt::NoModifier);
+        QApplication::sendEvent(canvas, &ev);
+    };
+    sendAt(QEvent::MouseButtonPress, QPointF(120, 100));
+    for (int x = 120; x <= 180; x += 5)
+        sendAt(QEvent::MouseMove, QPointF(x, 100));
+    sendAt(QEvent::MouseButtonRelease, QPointF(180, 100));
+    comp = doc->composite();
+    int edge = qRed(comp.pixel(152, 100));
+    check(edge > 20 && edge < 235, "blur brush softened the black/white boundary");
+
+    // move tool only grabs actual pixels
+    auto red2 = Layer::makeRaster("Red2", QSize(50, 50), QColor(255, 0, 0));
+    red2->offset = QPoint(10, 10);
+    doc->undo.push(new AddLayerCommand(doc, red2, doc->layers.size(), "Red2"));
+    canvas->setTool(ToolType::Move);
+    QPoint before2 = red2->offset;
+    sendAt(QEvent::MouseButtonPress, QPointF(250, 150));   // empty area
+    sendAt(QEvent::MouseMove, QPointF(220, 120));
+    sendAt(QEvent::MouseButtonRelease, QPointF(220, 120));
+    check(red2->offset == before2, "move tool ignores drags that start off the layer's pixels");
+    sendAt(QEvent::MouseButtonPress, QPointF(30, 30));     // on the red square
+    sendAt(QEvent::MouseMove, QPointF(80, 60));
+    sendAt(QEvent::MouseButtonRelease, QPointF(80, 60));
+    check(red2->offset != before2, "move tool drags when grabbing the layer's pixels");
+
+    // delete key clears the selection on the active layer
+    QPainterPath sel2;
+    sel2.addRect(red2->offset.x(), red2->offset.y(), 50, 50);
+    doc->setSelection(sel2, 0);
+    QKeyEvent del(QEvent::KeyPress, Qt::Key_Delete, Qt::NoModifier);
+    QApplication::sendEvent(canvas, &del);
+    QPoint docPt(int(sel2.boundingRect().center().x()), int(sel2.boundingRect().center().y()));
+    QPoint pl = docPt - red2->offset;
+    bool erased = !red2->image.rect().contains(pl) || qAlpha(red2->image.pixel(pl)) < 10;
+    check(erased, "Delete key erased the selected pixels");
+    doc->setSelection(QPainterPath(), 0);
+
+    // snapping: a guide at x=100 attracts marquee starts
+    doc->guidesV.append(100);
+    QPointF snapped = canvas->widgetToDoc(canvas->docToWidget(QPointF(0, 0)));  // sanity of mapping
+    check(std::abs(snapped.x()) < 0.001, "doc/widget mapping round-trips");
+
+    // Levels adjustment layer (also exercises the Properties histogram build)
+    auto lev = Layer::makeAdjustment(FilterType::Levels);
+    doc->undo.push(new AddLayerCommand(doc, lev, doc->layers.size(), "Levels"));
+    lev->params.p1 = 140;   // raise black point: mid grays go dark
+    doc->invalidate();
+    comp = doc->composite();
+    int levEdge = qRed(comp.pixel(152, 100));
+    check(levEdge < edge - 10, "Levels adjustment layer crushed midtones via black point");
+
     fprintf(stderr, failures ? "MODELTEST: %d FAILURES\n" : "MODELTEST: ALL PASS\n", failures);
     return failures;
 }

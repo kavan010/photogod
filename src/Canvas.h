@@ -32,6 +32,9 @@ public:
     void fillWith(const QColor& c);
     void clearSelectionArea();
 
+    QPointF docToWidget(const QPointF& p) const { return p * m_zoom + m_pan; }
+    QPointF widgetToDoc(const QPointF& p) const { return (p - m_pan) / m_zoom; }
+
 signals:
     void colorPicked(const QColor& c);
     void zoomChanged(double z);
@@ -52,15 +55,13 @@ protected:
     void leaveEvent(QEvent*) override;
 
 private:
-    enum class Act { None, Stroke, Marquee, Lasso, ShapeDrag, GradDrag, MoveLayer, PanView, CropDrag, XformDrag };
+    enum class Act { None, Stroke, Marquee, Lasso, ShapeDrag, GradDrag, MoveLayer, PanView, CropDrag, XformDrag, GuideDrag };
     enum class SelCombine { Replace, Add, Subtract };
 
-    QPointF docToWidget(const QPointF& p) const { return p * m_zoom + m_pan; }
-    QPointF widgetToDoc(const QPointF& p) const { return (p - m_pan) / m_zoom; }
     QTransform viewTransform() const;
 
     // stroke pipeline
-    bool beginStroke(const QPointF& docPos, bool erase);
+    bool beginStroke(const QPointF& docPos, bool erase, bool blur = false);
     void strokeTo(const QPointF& docPos);
     void endStroke();
     void stampAt(const QPointF& docPos);
@@ -78,6 +79,14 @@ private:
 
     void pickColor(const QPointF& docPos);
     void updateCursor();
+
+    // rulers / guides / snapping
+    void drawRulersAndGuides(QPainter& p);
+    QPointF snapPoint(const QPointF& docPt) const;
+    QPoint snapMoveOffset(QPoint offset, const QSize& size) const;
+    double snap1D(double v, const QList<double>& targets, double tol) const;
+    QList<double> snapTargetsX() const;
+    QList<double> snapTargetsY() const;
 
     // transform helpers
     QTransform xfMatrix() const;
@@ -106,6 +115,8 @@ private:
     std::shared_ptr<Layer> m_strokeLayer;
     bool m_strokeErase = false;
     bool m_strokeOnMask = false;
+    bool m_strokeBlur = false;
+    QImage m_blurSource;
     LayerState m_preState;
     QImage m_strokeBuf, m_strokeBase, m_strokeBaseMask;
     QImage m_stamp;
@@ -122,6 +133,11 @@ private:
     // crop
     QRectF m_cropRect;
     bool m_cropValid = false;
+
+    // guide dragging (0 = horizontal guide from top ruler, 1 = vertical from left)
+    int m_guideOrient = 0;
+    int m_guideIndex = -1;      // -1 = creating a new guide
+    double m_guideVal = 0;
 
     // transform state
     struct XForm {

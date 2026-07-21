@@ -28,5 +28,8 @@ void applyFilter(QImage& img, FilterType t, const FilterParams& p);
 // 3x box blur approximation of gaussian, Grayscale8 in place.
 void boxBlurGray(QImage& gray, int radius);
 
+// Gaussian-ish blur of an ARGB32_Premultiplied image in place.
+void gaussianBlurPremult(QImage& img, int radius);
+
 // Grayscale8 -> ARGB32_Premultiplied where alpha = gray (white premultiplied).
 QImage grayToAlphaImage(const QImage& gray);

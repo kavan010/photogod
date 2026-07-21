@@ -26,7 +26,7 @@ inline QStringList blendModeNames()
 enum class ToolType {
     Move, MarqueeRect, MarqueeEllipse, Lasso, Wand, Crop,
     Eyedropper, Brush, Eraser, Gradient, Text,
-    ShapeRect, ShapeEllipse, ShapeLine, Zoom, Hand
+    ShapeRect, ShapeEllipse, ShapeLine, Zoom, Hand, Blur
 };
 
 struct ToolSettings {
@@ -34,8 +34,14 @@ struct ToolSettings {
     int  brushOpacity  = 100;   // percent
     int  brushFlow     = 100;   // percent
     int  brushHardness = 80;    // percent
+    int  brushNoise    = 0;     // percent, texture grain
     bool pressureSize    = true;
     bool pressureOpacity = false;
+
+    int blurRadius = 10;        // gaussian blur brush radius
+
+    bool showRulers = true;     // rulers + guides overlay
+    bool snapping   = true;     // snap to guides / canvas edges
 
     int  wandTolerance  = 32;
     bool wandContiguous = true;
