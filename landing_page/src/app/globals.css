@@ -1,0 +1,112 @@
+@import "tailwindcss";
+
+/* class-based dark mode, toggled by .dark on <html> */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #f4f4f2;
+  --foreground: #0d0d0d;
+  --muted: #5c5c5c;
+  --dot: #d9d9d5;
+  --panel: #ffffff;
+  --panel-border: rgba(0, 0, 0, 0.07);
+  --checker-a: #e0e0dc;
+  --checker-b: #ffffff;
+  --shadow: rgba(0, 0, 0, 0.13);
+  --accent: #2f3b8f;
+}
+
+.dark {
+  --background: #131315;
+  --foreground: #f2f2f0;
+  --muted: #a0a0a0;
+  --dot: #2c2c30;
+  --panel: #1d1d20;
+  --panel-border: rgba(255, 255, 255, 0.09);
+  --checker-a: #34343a;
+  --checker-b: #232327;
+  --shadow: rgba(0, 0, 0, 0.5);
+  --accent: #8ea2ff;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-panel: var(--panel);
+  --color-accent: var(--accent);
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+    Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+  transition: background-color 250ms ease, color 250ms ease;
+}
+
+.dotgrid {
+  background-image: radial-gradient(var(--dot) 1.2px, transparent 1.2px);
+  background-size: 22px 22px;
+}
+
+/* photoshop transparency checkerboard */
+.checker {
+  background-color: var(--checker-b);
+  background-image: linear-gradient(45deg, var(--checker-a) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--checker-a) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--checker-a) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--checker-a) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+
+.sticker {
+  filter: drop-shadow(0 2px 7px var(--shadow));
+}
+
+.no-select {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/*
+ * Icons are single-color SVGs painted via mask, so they inherit `color`
+ * and therefore theme correctly in both light and dark.
+ */
+.icon {
+  display: inline-block;
+  background-color: currentColor;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
+@keyframes floaty {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-7px);
+  }
+}
+.floaty {
+  animation: floaty 7s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .floaty {
+    animation: none;
+  }
+}

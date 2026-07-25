@@ -23,10 +23,14 @@ public:
     void zoomActual();
     void fitToWindow();
 
+    enum class XformMode { Free, Skew, Distort, Perspective, Warp };
+
     void startTransform();               // Ctrl+T
     bool inTransform() const { return m_xf.active; }
     void commitTransform();
     void cancelTransform();
+    void setTransformMode(XformMode m);
+    XformMode transformMode() const { return m_xf.mode; }
 
     // Edit menu helpers
     void fillWith(const QColor& c);
@@ -53,6 +57,7 @@ protected:
     void tabletEvent(QTabletEvent*) override;
     void resizeEvent(QResizeEvent*) override;
     void leaveEvent(QEvent*) override;
+    void enterEvent(QEnterEvent*) override;
 
 private:
     enum class Act { None, Stroke, Marquee, Lasso, ShapeDrag, GradDrag, MoveLayer, PanView, CropDrag, XformDrag, GuideDrag };
@@ -92,6 +97,13 @@ private:
     QTransform xfMatrix() const;
     QVector<QPointF> xfHandlesDoc() const;   // 4 corners + 4 edge mids of source rect, mapped
     int hitHandle(const QPointF& widgetPos) const;
+    QPolygonF xfSrcRectCorners() const;      // TL,TR,BR,BL of (srcOffset,srcImage) in doc space
+    QPolygonF xfCurrentQuad() const;         // current visual quad, any non-Warp mode
+    QRectF xfBoundingRect() const;           // doc-space bounds of the current quad/grid
+    QVector<QPointF> xfSkewHandles() const;  // 4 edge-midpoint handles for Skew mode
+    int hitCornerHandle(const QPointF& widgetPos) const;
+    int hitWarpHandle(const QPointF& widgetPos) const;
+    void drawWarpCells(QPainter& p) const;   // piecewise quad-to-quad render of the warp mesh
 
     Document* m_doc;
     ToolSettings* m_ts;
@@ -146,13 +158,26 @@ private:
         QImage srcImage;
         QPoint srcOffset;
         LayerState preState;
+        bool liftedFromSelection = false;   // srcImage was cut from an active selection, leaving a hole in the layer
+        XformMode mode = XformMode::Free;
+
         QPointF center;
         double angle = 0, sx = 1, sy = 1;
         QPointF trans;
-        int dragMode = 0;       // 1=move 2=scale 3=rotate
+        int dragMode = 0;       // 1=move 2=scale 3=rotate 4=corner(Skew/Distort/Perspective) 5=warp point
         int handleIdx = -1;
         double startAngle = 0, startSx = 1, startSy = 1, grabAngle = 0;
         QPointF startTrans;
+
+        // Skew / Distort / Perspective: 4 free corners, doc space, order TL,TR,BR,BL
+        QVector<QPointF> corners;
+        QVector<QPointF> cornersStart;
+
+        // Warp: (kWarpGrid+1)^2 mesh points, doc space, row-major
+        static constexpr int kWarpGrid = 3;
+        QVector<QPointF> warpPts;
+        QVector<QPointF> warpPtsStart;
+        int warpDragIdx = -1;
     } m_xf;
 
     QTimer m_antsTimer;

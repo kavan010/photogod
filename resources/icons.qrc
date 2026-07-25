@@ -22,5 +22,7 @@
     <file alias="lock.svg">icons/lock.svg</file>
     <file alias="unlock.svg">icons/unlock.svg</file>
     <file alias="ruler.svg">icons/ruler.svg</file>
+    <file alias="home.svg">icons/home.svg</file>
+    <file alias="new-file.svg">icons/new-file.svg</file>
   </qresource>
 </RCC>

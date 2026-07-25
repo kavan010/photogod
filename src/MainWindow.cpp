@@ -3,8 +3,15 @@
 #include "Panels.h"
 #include "Dialogs.h"
 #include "Commands.h"
+#include "HomePage.h"
+#include "CommandPalette.h"
+#include "DockTitleBar.h"
+#include "HistoryPanel.h"
+#include <QPointer>
+#include <QSettings>
 #include <QDockWidget>
 #include <QTabWidget>
+#include <QTabBar>
 #include <QToolBar>
 #include <QToolButton>
 #include <QStackedWidget>
@@ -40,15 +47,41 @@ MainWindow::MainWindow()
     setAcceptDrops(true);
 
     m_tabs = new QTabWidget;
+    m_tabs->setObjectName("docTabs");
     m_tabs->setTabsClosable(true);
     m_tabs->setMovable(true);
     m_tabs->setDocumentMode(true);
-    setCentralWidget(m_tabs);
+
+    // tabbed dock panels show their selector on top, not at the bottom
+    setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
+    // DockTitleBar drives dragging itself (Photoshop-style tab handles + drop
+    // hints), so Qt's own GroupedDragging rubber-band stays off — two drag
+    // systems on one press fight each other.
+    setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowTabbedDocks
+                   | QMainWindow::AllowNestedDocks);
+
+    m_home = new HomePage;
+    connect(m_home, &HomePage::newRequested, this, [this] { newDocument(); });
+    connect(m_home, &HomePage::openRequested, this, [this] {
+        QString path = QFileDialog::getOpenFileName(this, "Open",
+            QString(), "Images / Projects (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff *.pgd);;All files (*)");
+        if (!path.isEmpty()) openPath(path);
+    });
+    connect(m_home, &HomePage::projectRequested, this, [this](const QString& path) {
+        openPath(path);
+    });
+
+    m_central = new QStackedWidget;
+    m_central->addWidget(m_home);   // index 0
+    m_central->addWidget(m_tabs);   // index 1
+    setCentralWidget(m_central);
     connect(m_tabs, &QTabWidget::tabCloseRequested, this, [this](int i) { closeTab(i); });
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
         Document* doc = currentDoc();
         m_layers->setDocument(doc);
         m_props->setDocument(doc);
+        // built later than this connect, but always live by the time it fires
+        if (m_history) m_history->setDocument(doc);
         if (doc) {
             m_undoGroup.setActiveStack(&doc->undo);
             m_statusSize->setText(QString("%1 x %2").arg(doc->width()).arg(doc->height()));
@@ -65,6 +98,7 @@ MainWindow::MainWindow()
     buildToolbar();
     buildOptionsBar();
     buildDocks();
+    buildCommandPalette();
     buildMenus();
 
     m_statusPos = new QLabel("-");
@@ -74,6 +108,15 @@ MainWindow::MainWindow()
     statusBar()->addPermanentWidget(m_statusZoom);
     statusBar()->addWidget(m_statusPos);
     statusBar()->showMessage("Ctrl+N new document · Ctrl+O open image · drag & drop images onto the window", 8000);
+
+    // start on the home screen (docks/toolbars hidden until a document is open)
+    m_central->setCurrentWidget(m_home);
+    updateChromeForView();
+}
+
+MainWindow::~MainWindow()
+{
+    m_shuttingDown = true;
 }
 
 Canvas* MainWindow::currentCanvas() const
@@ -85,6 +128,44 @@ Document* MainWindow::currentDoc() const
 {
     Canvas* c = currentCanvas();
     return c ? c->document() : nullptr;
+}
+
+// ============================ home / editor view ============================
+
+void MainWindow::showHome()
+{
+    m_home->refresh();
+    m_central->setCurrentWidget(m_home);
+    updateChromeForView();
+    statusBar()->showMessage("Home — pick a recent project or start a new one", 4000);
+}
+
+void MainWindow::showEditor()
+{
+    m_central->setCurrentWidget(m_tabs);
+    updateChromeForView();
+    if (Canvas* c = currentCanvas()) c->setFocus();
+}
+
+void MainWindow::updateChromeForView()
+{
+    // the editing chrome (tool docks + toolbars) is meaningless on the start screen
+    bool onHome = (m_central->currentWidget() == m_home);
+    m_switchingView = true;
+    if (onHome) {
+        // Hide the panels, but remember the user's intent so panels they closed
+        // themselves stay closed on the way back. isVisible() is useless here —
+        // during construction the window isn't shown yet, so it reports false
+        // for everything; m_userClosed is maintained from the close signal.
+        for (QDockWidget* d : findChildren<QDockWidget*>())
+            d->hide();
+    } else {
+        for (QDockWidget* d : findChildren<QDockWidget*>())
+            if (!m_userClosed.contains(d)) d->show();
+    }
+    m_switchingView = false;
+    for (QToolBar* t : findChildren<QToolBar*>())
+        t->setVisible(!onHome);
 }
 
 // ============================ documents / tabs ============================
@@ -122,12 +203,17 @@ void MainWindow::addDocument(Document* doc)
 
     int idx = m_tabs->addTab(canvas, doc->name);
     m_tabs->setCurrentIndex(idx);
+    showEditor();
     canvas->setTool(m_tool);
     canvas->setFocus();
 }
 
 void MainWindow::updateTabTitle(Document* doc)
 {
+    // On shutdown the tab widget is torn down before the documents it owns, and
+    // each dying QUndoStack still emits cleanChanged on its way out. Touching
+    // the half-destroyed QTabWidget from that signal crashes.
+    if (m_shuttingDown || !m_tabs) return;
     for (int i = 0; i < m_tabs->count(); ++i) {
         auto* c = qobject_cast<Canvas*>(m_tabs->widget(i));
         if (c && c->document() == doc) {
@@ -160,6 +246,8 @@ void MainWindow::openPath(const QString& path)
             return;
         }
         addDocument(doc);
+        Recents::touch(path, doc->name);
+        Recents::saveThumbnail(path, doc->composite());
         return;
     }
     QImageReader reader(path);
@@ -188,6 +276,8 @@ bool MainWindow::closeTab(int index)
     m_undoGroup.removeStack(&doc->undo);
     m_tabs->removeTab(index);
     canvas->deleteLater();
+    if (m_tabs->count() == 0)
+        showHome();
     return true;
 }
 
@@ -199,7 +289,15 @@ void MainWindow::closeEvent(QCloseEvent* e)
             return;
         }
     }
+    savePanelLayout();
     e->accept();
+}
+
+void MainWindow::savePanelLayout()
+{
+    QSettings s;
+    s.setValue("layout/geometry", saveGeometry());
+    s.setValue("layout/state", saveState());
 }
 
 // ============================ save / export ============================
@@ -220,6 +318,8 @@ bool MainWindow::saveDoc(Document* doc, bool saveAs)
         }
         doc->name = QFileInfo(path).completeBaseName();
         updateTabTitle(doc);
+        Recents::touch(path, doc->name);
+        Recents::saveThumbnail(path, doc->composite());
         statusBar()->showMessage("Saved " + path, 4000);
         return true;
     }
@@ -429,11 +529,20 @@ void MainWindow::buildToolbar()
     auto* group = new QActionGroup(this);
     group->setExclusive(true);
 
-    auto addTool = [&](ToolType t, const QString& iconName, const QString& name, const QString& shortcut) {
+    // name = short label, desc = what the tool actually does (shown on hover).
+    auto addTool = [&](ToolType t, const QString& iconName, const QString& name,
+                       const QString& shortcut, const QString& desc) {
         auto* a = new QAction(name, this);
         a->setIcon(QIcon(QString(":/icons/%1.svg").arg(iconName)));
         a->setCheckable(true);
-        a->setToolTip(name + (shortcut.isEmpty() ? "" : " (" + shortcut + ")"));
+        // Rich text so the tool name reads as a heading above its description.
+        QString tip = "<b>" + name.toHtmlEscaped() + "</b>";
+        if (!shortcut.isEmpty())
+            tip += " <span style='color:#8a8a92;'>" + shortcut.toHtmlEscaped() + "</span>";
+        if (!desc.isEmpty())
+            tip += "<br><span style='color:#b6b6be;'>" + desc.toHtmlEscaped() + "</span>";
+        a->setToolTip(tip);
+        a->setStatusTip(desc.isEmpty() ? name : desc);
         if (!shortcut.isEmpty()) a->setShortcut(QKeySequence(shortcut));
         connect(a, &QAction::triggered, this, [this, t] { setTool(t); });
         group->addAction(a);
@@ -442,26 +551,44 @@ void MainWindow::buildToolbar()
         return a;
     };
 
-    addTool(ToolType::Move, "move", "Move", "V");
-    addTool(ToolType::MarqueeRect, "marquee-rect", "Rectangular marquee — Shift adds, Alt subtracts, Ctrl-drag square", "");
-    addTool(ToolType::MarqueeEllipse, "marquee-ellipse", "Elliptical marquee (press M to toggle)", "");
-    addTool(ToolType::Lasso, "lasso", "Polygon lasso selection", "L");
-    addTool(ToolType::Wand, "wand", "Magic wand", "W");
-    addTool(ToolType::Crop, "crop", "Crop — drag then Enter", "C");
-    addTool(ToolType::Eyedropper, "eyedropper", "Eyedropper", "I");
+    addTool(ToolType::Move, "move", "Move", "V",
+            "Drag layers and selections around the canvas");
+    // No "M" here — a separate action below owns M to toggle marquee shape.
+    addTool(ToolType::MarqueeRect, "marquee-rect", "Rectangular Marquee", "",
+            "Select a box. Shift adds, Alt subtracts, Ctrl-drag for a square");
+    addTool(ToolType::MarqueeEllipse, "marquee-ellipse", "Elliptical Marquee", "",
+            "Select an oval — press M to toggle with the rectangle marquee");
+    addTool(ToolType::Lasso, "lasso", "Polygon Lasso", "L",
+            "Click points to outline a freeform selection; close it to finish");
+    addTool(ToolType::Wand, "wand", "Magic Wand", "W",
+            "Select areas of similar color — tune tolerance in the options bar");
+    addTool(ToolType::Crop, "crop", "Crop", "C",
+            "Drag the area to keep, then press Enter to apply");
+    addTool(ToolType::Eyedropper, "eyedropper", "Eyedropper", "I",
+            "Click the canvas to sample a color into the foreground swatch");
     tb->addSeparator();
-    addTool(ToolType::Brush, "brush", "Brush", "B");
-    addTool(ToolType::Eraser, "eraser", "Eraser", "E");
-    addTool(ToolType::Blur, "blur", "Blur brush (gaussian)", "R");
-    addTool(ToolType::Gradient, "gradient", "Gradient", "G");
-    addTool(ToolType::Text, "text", "Text — click canvas", "T");
+    addTool(ToolType::Brush, "brush", "Brush", "B",
+            "Paint with the foreground color — [ and ] change the size");
+    addTool(ToolType::Eraser, "eraser", "Eraser", "E",
+            "Erase pixels to transparency on the active layer");
+    addTool(ToolType::Blur, "blur", "Blur Brush", "R",
+            "Paint a gaussian blur to soften detail where you drag");
+    addTool(ToolType::Gradient, "gradient", "Gradient", "G",
+            "Drag to fill with a foreground-to-background ramp");
+    addTool(ToolType::Text, "text", "Text", "T",
+            "Click the canvas to place an editable text layer");
     tb->addSeparator();
-    addTool(ToolType::ShapeRect, "shape-rect", "Rectangle shape (press U to cycle shapes)", "");
-    addTool(ToolType::ShapeEllipse, "shape-ellipse", "Ellipse shape", "");
-    addTool(ToolType::ShapeLine, "shape-line", "Line shape", "");
+    addTool(ToolType::ShapeRect, "shape-rect", "Rectangle Shape", "",
+            "Drag out a rectangle — press U to cycle through the shape tools");
+    addTool(ToolType::ShapeEllipse, "shape-ellipse", "Ellipse Shape", "",
+            "Drag out an ellipse — Shift constrains it to a circle");
+    addTool(ToolType::ShapeLine, "shape-line", "Line Shape", "",
+            "Drag a straight line — Shift snaps to 45° angles");
     tb->addSeparator();
-    addTool(ToolType::Zoom, "zoom", "Zoom — click to zoom in, Alt-click out", "Z");
-    addTool(ToolType::Hand, "hand", "Hand (pan) — or hold Space", "H");
+    addTool(ToolType::Zoom, "zoom", "Zoom", "Z",
+            "Click to zoom in, Alt-click to zoom out");
+    addTool(ToolType::Hand, "hand", "Hand", "H",
+            "Drag to pan the canvas — or just hold Space with any tool");
 
     m_toolActions[int(ToolType::Move)]->setChecked(true);
 
@@ -723,9 +850,21 @@ void MainWindow::buildDocks()
         auto* d = new QDockWidget(title);
         d->setObjectName(title);
         d->setWidget(w);
-        d->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetClosable
-                       | QDockWidget::DockWidgetFloatable);
+        // No DockWidgetMovable: the tab strip runs the drag, and leaving Qt's
+        // mover on would start a competing rubber-band drag from the same press.
+        d->setFeatures(QDockWidget::DockWidgetClosable | QDockWidget::DockWidgetFloatable);
+        d->setAllowedAreas(Qt::AllDockWidgetAreas);
+        // The tab strip IS the panel's header — its tabs are the drag handles.
+        // Nothing sits above it, so there is only ever one header per panel.
+        d->setTitleBarWidget(new DockTitleBar(d));
         addDockWidget(area, d);
+        // Record deliberate show/hide only. updateChromeForView() flips panels
+        // in bulk when swapping Home/editor; that must not look like intent.
+        connect(d->toggleViewAction(), &QAction::toggled, this, [this, d](bool on) {
+            if (m_switchingView) return;
+            if (on) m_userClosed.remove(d);
+            else    m_userClosed.insert(d);
+        });
         return d;
     };
 
@@ -734,8 +873,7 @@ void MainWindow::buildDocks()
     m_layers = new LayersPanel;
     m_brushes = new BrushesPanel(&m_ts);
     m_adjust = new AdjustmentsPanel;
-    auto* history = new QUndoView(&m_undoGroup);
-    history->setEmptyLabel("<empty history>");
+    m_history = new HistoryPanel(&m_undoGroup);
 
     connect(m_brushes, &BrushesPanel::presetChosen, this, [this] {
         setTool(ToolType::Brush);
@@ -755,23 +893,102 @@ void MainWindow::buildDocks()
     auto* dLayers = mkDock("Layers", m_layers, Qt::RightDockWidgetArea);
     auto* dProps = mkDock("Properties", m_props, Qt::RightDockWidgetArea);
     auto* dAdjust = mkDock("Adjustments", m_adjust, Qt::RightDockWidgetArea);
-    auto* dHistory = mkDock("History", history, Qt::RightDockWidgetArea);
+    auto* dHistory = mkDock("History", m_history, Qt::RightDockWidgetArea);
     m_dockProps = dProps;
+    m_dockLayers = dLayers;
 
-    // middle group: Brushes / Properties / Adjustments share one slot
-    tabifyDockWidget(dBrushes, dProps);
-    tabifyDockWidget(dProps, dAdjust);
-    dBrushes->raise();
-    // bottom group: Layers / History
-    tabifyDockWidget(dLayers, dHistory);
-    dLayers->raise();
-    resizeDocks({dColor, dBrushes, dLayers}, {230, 190, 320}, Qt::Vertical);
+    // Default layout: every panel is its own stacked slot down the right edge.
+    // Nothing is pre-tabified — drag a header onto another panel to tab them,
+    // or out of the window to float it.
+    m_docks = QList<QDockWidget*>{dColor, dBrushes, dLayers, dProps, dAdjust, dHistory};
+    resizeDocks(m_docks, QList<int>{200, 170, 260, 200, 180, 160}, Qt::Vertical);
+
+    // Remember whatever arrangement the user lands on.
+    m_defaultLayout = saveState();
+    QSettings s;
+    const QByteArray geo = s.value("layout/geometry").toByteArray();
+    const QByteArray st = s.value("layout/state").toByteArray();
+    if (!geo.isEmpty()) restoreGeometry(geo);
+    if (!st.isEmpty()) restoreState(st);
+
+    // Qt grows its own QTabBar for each tabbed dock group. Our strip already
+    // shows those tabs, so the native one would be a second, duplicate header —
+    // collapse it. They are created on demand, hence the polish-time sweep.
+    hideNativeDockTabs();
+    for (QDockWidget* d : m_docks)
+        if (auto* strip = qobject_cast<DockTitleBar*>(d->titleBarWidget()))
+            strip->refresh();
+}
+
+void MainWindow::tabifyPanelsForTest(const QString& a, const QString& b)
+{
+    QDockWidget *da = nullptr, *db = nullptr;
+    for (QDockWidget* d : m_docks) {
+        if (d->objectName() == a) da = d;
+        if (d->objectName() == b) db = d;
+    }
+    if (!da || !db) return;
+    tabifyDockWidget(da, db);
+    da->show();
+    da->raise();
+    hideNativeDockTabs();
+    for (QDockWidget* d : m_docks)
+        if (auto* s = qobject_cast<DockTitleBar*>(d->titleBarWidget())) s->refresh();
+}
+
+void MainWindow::hideNativeDockTabs()
+{
+    for (QTabBar* tb : findChildren<QTabBar*>(QString(), Qt::FindDirectChildrenOnly)) {
+        tb->setFixedHeight(0);
+        tb->hide();
+    }
+}
+
+void MainWindow::resetPanelLayout()
+{
+    // Undo any floating/tabbing and put every panel back in its own slot.
+    // Reset means "all panels back", so previous closes are forgotten too —
+    // otherwise updateChromeForView() would re-hide them on the next switch.
+    m_switchingView = true;
+    m_userClosed.clear();
+    for (QDockWidget* d : m_docks) {
+        d->setFloating(false);
+        d->show();
+    }
+    restoreState(m_defaultLayout);
+    m_switchingView = false;
 }
 
 // ============================ menus ============================
 
 void MainWindow::buildMenus()
 {
+    // ---- Home / New icon buttons beside the File menu (icons only, minimal) ----
+    auto* leftBar = new QWidget;
+    auto* leftLay = new QHBoxLayout(leftBar);
+    leftLay->setContentsMargins(6, 0, 4, 0);
+    leftLay->setSpacing(2);
+
+    auto* homeBtn = new QToolButton;
+    homeBtn->setIcon(QIcon(":/icons/home.svg"));
+    homeBtn->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    homeBtn->setAutoRaise(true);
+    homeBtn->setCursor(Qt::PointingHandCursor);
+    homeBtn->setToolTip("Go to the start screen");
+    connect(homeBtn, &QToolButton::clicked, this, [this] { showHome(); });
+
+    auto* newBtn = new QToolButton;
+    newBtn->setIcon(QIcon(":/icons/new-file.svg"));
+    newBtn->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    newBtn->setAutoRaise(true);
+    newBtn->setCursor(Qt::PointingHandCursor);
+    newBtn->setToolTip("New document (Ctrl+N)");
+    connect(newBtn, &QToolButton::clicked, this, [this] { newDocument(); });
+
+    leftLay->addWidget(homeBtn);
+    leftLay->addWidget(newBtn);
+    menuBar()->setCornerWidget(leftBar, Qt::TopLeftCorner);
+
     // ---- File ----
     QMenu* file = menuBar()->addMenu("&File");
     file->addAction("New…", QKeySequence::New, this, [this] { newDocument(); });
@@ -833,9 +1050,21 @@ void MainWindow::buildMenus()
         if (Canvas* c = currentCanvas()) c->clearSelectionArea();
     });
     edit->addSeparator();
-    edit->addAction("Free Transform", QKeySequence("Ctrl+T"), this, [this] {
-        if (Canvas* c = currentCanvas()) c->startTransform();
-    });
+    QMenu* xform = edit->addMenu("Transform");
+    auto addXformMode = [&](const QString& label, const QKeySequence& seq, Canvas::XformMode mode) {
+        xform->addAction(label, seq, this, [this, mode] {
+            Canvas* c = currentCanvas();
+            if (!c) return;
+            if (!c->inTransform()) c->startTransform();
+            if (c->inTransform()) c->setTransformMode(mode);
+        });
+    };
+    addXformMode("Free Transform", QKeySequence("Ctrl+T"), Canvas::XformMode::Free);
+    xform->addSeparator();
+    addXformMode("Skew", QKeySequence(), Canvas::XformMode::Skew);
+    addXformMode("Distort", QKeySequence(), Canvas::XformMode::Distort);
+    addXformMode("Perspective", QKeySequence(), Canvas::XformMode::Perspective);
+    addXformMode("Warp", QKeySequence(), Canvas::XformMode::Warp);
 
     // ---- Image ----
     QMenu* image = menuBar()->addMenu("&Image");
@@ -987,13 +1216,226 @@ void MainWindow::buildMenus()
         for (QDockWidget* d : findChildren<QDockWidget*>())
             d->setVisible(!anyVisible);
     });
+    window->addSeparator();
+    window->addAction("Reset Panel Layout", this, [this] {
+        resetPanelLayout();
+        statusBar()->showMessage("Panel layout reset", 2000);
+    });
 
     // ---- Help ----
     QMenu* help = menuBar()->addMenu("&Help");
+    // Shortcut lives on the application-wide action in buildCommandPalette();
+    // declaring it here too would make Qt report an ambiguous shortcut.
+    QAction* paletteAct = help->addAction("Command Palette…", this, [this] {
+        showCommandPalette();
+    });
+    paletteAct->setToolTip("Universal search — Ctrl+Shift+P or Ctrl+Shift+Space");
+    help->addSeparator();
     help->addAction("About", this, [this] {
         QMessageBox::about(this, "About PhotoGod",
             "<b>PhotoGod</b> — a fast layer-based image editor.<br><br>"
             "Qt 6 · C++20 · layers, masks, brushes, selections, adjustments.<br>"
             "Save projects as .pgd, export PNG/JPG/WebP.");
     });
+}
+
+// ============================ command palette ============================
+
+void MainWindow::buildCommandPalette()
+{
+    m_palette = new CommandPalette(this);
+    m_palette->setProvider([this] { return collectCommands(); });
+
+    // Both shortcuts open the same universal search.
+    for (const char* seq : {"Ctrl+Shift+P", "Ctrl+Shift+Space"}) {
+        auto* a = new QAction(this);
+        a->setShortcut(QKeySequence(seq));
+        a->setShortcutContext(Qt::ApplicationShortcut);
+        connect(a, &QAction::triggered, this, [this] { showCommandPalette(); });
+        addAction(a);
+    }
+}
+
+void MainWindow::showCommandPalette(const QString& query)
+{
+    if (m_palette) m_palette->openPalette(query);
+}
+
+bool MainWindow::runPaletteCommand(const QString& title)
+{
+    for (const PaletteCommand& c : collectCommands()) {
+        if (c.title == title && c.enabled && c.run) {
+            c.run();
+            return true;
+        }
+    }
+    return false;
+}
+
+void MainWindow::revealLayer(int index)
+{
+    Document* doc = currentDoc();
+    if (!doc || index < 0 || index >= doc->layers.size()) return;
+    doc->setActiveIndex(index);
+    if (m_dockLayers) {
+        m_dockLayers->show();
+        m_dockLayers->raise();
+    }
+    m_layers->highlightLayer(index);
+    statusBar()->showMessage("Selected layer: " + doc->layers[index]->name, 3000);
+}
+
+QList<PaletteCommand> MainWindow::collectCommands()
+{
+    QList<PaletteCommand> out;
+    Document* doc = currentDoc();
+    const bool hasDoc = (doc != nullptr);
+
+    // ---- tools ----
+    struct ToolEntry { ToolType t; const char* icon; const char* name; const char* keys; };
+    static const ToolEntry kTools[] = {
+        {ToolType::Move,           "move",            "Move",                "transform position drag"},
+        {ToolType::MarqueeRect,    "marquee-rect",    "Rectangular Marquee", "select selection box"},
+        {ToolType::MarqueeEllipse, "marquee-ellipse", "Elliptical Marquee",  "select selection circle oval"},
+        {ToolType::Lasso,          "lasso",           "Polygon Lasso",       "select selection freeform"},
+        {ToolType::Wand,           "wand",            "Magic Wand",          "select selection color range"},
+        {ToolType::Crop,           "crop",            "Crop",                "trim resize"},
+        {ToolType::Eyedropper,     "eyedropper",      "Eyedropper",          "pick color sample"},
+        {ToolType::Brush,          "brush",           "Brush",               "paint draw"},
+        {ToolType::Eraser,         "eraser",          "Eraser",              "delete rub out"},
+        {ToolType::Blur,           "blur",            "Blur Brush",          "soften smudge gaussian"},
+        {ToolType::Gradient,       "gradient",        "Gradient",            "ramp fade fill"},
+        {ToolType::Text,           "text",            "Text",                "type font words"},
+        {ToolType::ShapeRect,      "shape-rect",      "Rectangle Shape",     "draw box square"},
+        {ToolType::ShapeEllipse,   "shape-ellipse",   "Ellipse Shape",       "draw circle oval"},
+        {ToolType::ShapeLine,      "shape-line",      "Line Shape",          "draw stroke"},
+        {ToolType::Zoom,           "zoom",            "Zoom",                "magnify scale view"},
+        {ToolType::Hand,           "hand",            "Hand",                "pan scroll navigate"},
+    };
+    for (const ToolEntry& e : kTools) {
+        PaletteCommand c;
+        c.category = "Tool";
+        c.title = e.name;
+        c.keywords = e.keys;
+        c.iconPath = QString(":/icons/%1.svg").arg(e.icon);
+        c.enabled = hasDoc;
+        if (auto* a = m_toolActions.value(int(e.t)))
+            c.detail = a->shortcut().toString(QKeySequence::NativeText);
+        ToolType t = e.t;
+        c.run = [this, t] { setTool(t); };
+        out.append(c);
+    }
+
+    // ---- adjustments / filters ----
+    for (FilterType t : {FilterType::Brightness, FilterType::Contrast, FilterType::Saturation,
+                         FilterType::Hue, FilterType::Exposure, FilterType::Levels,
+                         FilterType::Pixelate, FilterType::Blur}) {
+        PaletteCommand c;
+        c.category = "Adjust";
+        c.title = filterName(t) + "…";
+        c.detail = "apply to layer";
+        c.keywords = "filter adjustment " + filterName(t);
+        c.enabled = hasDoc;
+        c.run = [this, t] { openFilterDialog(t); };
+        out.append(c);
+    }
+    for (FilterType t : {FilterType::Grayscale, FilterType::Invert}) {
+        PaletteCommand c;
+        c.category = "Adjust";
+        c.title = (t == FilterType::Grayscale) ? "Grayscale" : "Invert Colors";
+        c.detail = "apply to layer";
+        c.keywords = (t == FilterType::Grayscale) ? "black white desaturate mono"
+                                                  : "negative flip colors";
+        c.enabled = hasDoc;
+        c.run = [this, t] { applyDirectFilter(t); };
+        out.append(c);
+    }
+    // adjustment layers (non-destructive)
+    for (FilterType t : {FilterType::Brightness, FilterType::Contrast, FilterType::Saturation,
+                         FilterType::Hue, FilterType::Exposure, FilterType::Levels,
+                         FilterType::Grayscale}) {
+        PaletteCommand c;
+        c.category = "Adj Layer";
+        c.title = "New " + QString(t == FilterType::Grayscale ? "Black & White" : filterName(t))
+                + " Adjustment Layer";
+        c.detail = "non-destructive";
+        c.keywords = "adjustment layer new " + filterName(t);
+        c.enabled = hasDoc;
+        c.run = [this, t] {
+            Document* d = currentDoc();
+            if (!d) return;
+            auto l = Layer::makeAdjustment(t);
+            if (t == FilterType::Grayscale) l->name = "Black & White";
+            d->undo.push(new AddLayerCommand(d, l, d->activeIndex + 1, "New Adjustment"));
+            if (m_dockProps) { m_dockProps->show(); m_dockProps->raise(); }
+        };
+        out.append(c);
+    }
+
+    // ---- layers of the current document (top-most first, as shown in the panel) ----
+    if (doc) {
+        for (int i = doc->layers.size() - 1; i >= 0; --i) {
+            const auto& l = doc->layers[i];
+            PaletteCommand c;
+            c.category = "Layer";
+            c.title = l->name;
+            QStringList bits;
+            bits << (l->type == Layer::Adjustment ? "adjustment"
+                   : l->type == Layer::Text       ? "text" : "raster");
+            if (!l->visible) bits << "hidden";
+            if (l->locked)   bits << "locked";
+            if (l->hasMask()) bits << "mask";
+            c.detail = bits.join(" · ");
+            c.keywords = "layer " + bits.join(" ") + " " + l->name;
+            c.run = [this, i] { revealLayer(i); };
+            out.append(c);
+        }
+    }
+
+    // ---- every menu action, harvested so the palette can't drift from the menus ----
+    std::function<void(QMenu*, const QString&)> harvest =
+        [&](QMenu* menu, const QString& prefix) {
+            for (QAction* a : menu->actions()) {
+                if (a->isSeparator()) continue;
+                if (QMenu* sub = a->menu()) {
+                    harvest(sub, prefix + a->text().remove('&') + " › ");
+                    continue;
+                }
+                QString label = a->text().remove('&');
+                if (label.isEmpty()) continue;
+                PaletteCommand c;
+                c.category = prefix.isEmpty() ? "Command" : prefix.chopped(3);
+                c.title = label;
+                c.detail = a->shortcut().toString(QKeySequence::NativeText);
+                c.keywords = a->toolTip().remove('&');
+                c.enabled = a->isEnabled();
+                QPointer<QAction> ptr(a);
+                c.run = [ptr] { if (ptr) ptr->trigger(); };
+                out.append(c);
+            }
+        };
+    for (QAction* topAct : menuBar()->actions()) {
+        QString top = topAct->text().remove('&');
+        // Filter/adjustment entries are already listed above with richer keywords.
+        if (top == "Filter") continue;
+        if (QMenu* m = topAct->menu())
+            harvest(m, top + " › ");
+    }
+
+    // ---- panels ----
+    for (QDockWidget* d : findChildren<QDockWidget*>()) {
+        PaletteCommand c;
+        c.category = "Panel";
+        c.title = (d->isVisible() ? "Hide " : "Show ") + d->objectName() + " Panel";
+        c.keywords = "panel dock toggle window " + d->objectName();
+        QPointer<QDockWidget> ptr(d);
+        c.run = [ptr] {
+            if (!ptr) return;
+            ptr->setVisible(!ptr->isVisible());
+            if (ptr->isVisible()) ptr->raise();
+        };
+        out.append(c);
+    }
+
+    return out;
 }

@@ -94,6 +94,10 @@ public:
     explicit LayersPanel(QWidget* parent = nullptr);
     void setDocument(Document* doc);
 
+    // Scroll the given document layer into view and select its row (used by the
+    // command palette so a chosen layer is visibly highlighted).
+    void highlightLayer(int layerIndex);
+
     // exposed so MainWindow menu actions can trigger the same behavior
     QToolButton* addButton() const { return m_btnAdd; }
     QToolButton* dupButton() const { return m_btnDup; }

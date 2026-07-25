@@ -23,6 +23,10 @@ add_executable(photogod
   src/Commands.cpp
   src/Panels.cpp
   src/Dialogs.cpp
+  src/HomePage.cpp
+  src/CommandPalette.cpp
+  src/DockTitleBar.cpp
+  src/HistoryPanel.cpp
 )
 
 target_link_libraries(photogod PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)

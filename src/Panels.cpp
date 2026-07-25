@@ -261,8 +261,8 @@ void ColorPanel::applyHsv(bool notifyRecent)
 
 void ColorPanel::refresh()
 {
-    m_fgBtn->setStyleSheet(QString("background:%1; border:2px solid #ddd;").arg(m_ts->fg.name()));
-    m_bgBtn->setStyleSheet(QString("background:%1; border:1px solid #888;").arg(m_ts->bg.name()));
+    m_fgBtn->setStyleSheet(QString("background:%1; border:1px solid #55555c; border-radius:4px;").arg(m_ts->fg.name()));
+    m_bgBtn->setStyleSheet(QString("background:%1; border:1px solid #55555c; border-radius:4px;").arg(m_ts->bg.name()));
     m_updating = true;
     m_r->setValue(m_ts->fg.red());
     m_g->setValue(m_ts->fg.green());
@@ -271,9 +271,9 @@ void ColorPanel::refresh()
     m_updating = false;
     for (int i = 0; i < m_recentBtns.size(); ++i) {
         if (i < m_recent.size())
-            m_recentBtns[i]->setStyleSheet(QString("background:%1; border:1px solid #666;").arg(m_recent[i].name()));
+            m_recentBtns[i]->setStyleSheet(QString("background:%1; border:1px solid #4a4a50; border-radius:3px;").arg(m_recent[i].name()));
         else
-            m_recentBtns[i]->setStyleSheet("background:transparent; border:1px dashed #555;");
+            m_recentBtns[i]->setStyleSheet("background:transparent; border:1px solid #313136; border-radius:3px;");
     }
 }
 
@@ -568,6 +568,18 @@ void LayersPanel::setDocument(Document* doc)
         });
     }
     rebuild();
+}
+
+void LayersPanel::highlightLayer(int layerIndex)
+{
+    if (!m_doc || layerIndex < 0 || layerIndex >= m_doc->layers.size()) return;
+    const int row = layerToRow(layerIndex);
+    if (row < 0 || row >= m_list->count()) return;
+
+    m_list->setCurrentRow(row);
+    if (auto* it = m_list->item(row))
+        m_list->scrollToItem(it, QAbstractItemView::PositionAtCenter);
+    m_list->setFocus(Qt::OtherFocusReason);
 }
 
 void LayersPanel::rebuild()

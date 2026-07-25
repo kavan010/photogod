@@ -7,10 +7,43 @@
 #include <QBuffer>
 #include <QTransform>
 
+// ============================ HistoryStack ============================
+
+void HistoryStack::push(QUndoCommand* cmd)
+{
+    // The version about to be superseded is on screen right now — this is the
+    // only moment it can be photographed without disturbing the document.
+    snapshotCurrent();
+    const int before = index();
+    QUndoStack::push(cmd);
+    // Pushing while sitting behind the tip discarded the redo tail; so must the
+    // snapshots of those now-unreachable versions. A merged command (index
+    // unchanged) leaves its own snapshot stale, so drop that too.
+    dropSnapshotsAbove(index() == before ? before - 1 : before);
+    snapshotCurrent();
+}
+
+void HistoryStack::snapshotCurrent()
+{
+    if (!m_doc) return;
+    const int i = index();
+    if (m_snaps.contains(i)) return;
+    m_snaps.insert(i, m_doc->composite());
+}
+
+void HistoryStack::dropSnapshotsAbove(int index)
+{
+    for (auto it = m_snaps.begin(); it != m_snaps.end(); )
+        it = (it.key() > index) ? m_snaps.erase(it) : std::next(it);
+}
+
+// ============================ Document ============================
+
 Document::Document(const QSize& size, const QColor& bg, QObject* parent)
     : QObject(parent), m_size(size)
 {
     undo.setUndoLimit(40);
+    undo.setDocument(this);
     auto base = Layer::makeRaster("Background", size, bg);
     layers.append(base);
     activeIndex = 0;

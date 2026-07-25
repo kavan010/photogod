@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /home/kavang/Desktop/photogod/ && ls -la /home/kavang/Desktop/photogod/landing_page/)",
+      "Read(//home/kavang/Desktop/photogod/**)",
+      "Bash(npx --yes create-next-app@latest . --ts --tailwind --app --eslint --src-dir --import-alias \"@/*\" --no-turbopack --use-npm --yes)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000)",
+      "Bash(npm init *)",
+      "Read(//home/kavang/.cache/**)",
+      "Bash(npx --yes playwright install chromium)",
+      "Bash(node shot.js)",
+      "Bash(npx eslint *)",
+      "Bash(pkill -f \"next dev\")",
+      "Bash(pkill -f \"next-server\")"
+    ]
+  }
+}

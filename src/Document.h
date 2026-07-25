@@ -3,8 +3,49 @@
 #include <QObject>
 #include <QUndoStack>
 #include <QPainterPath>
+#include <QHash>
+#include <QImage>
 #include <QList>
 #include <memory>
+
+class Document;
+
+// Undo stack that also keeps a picture of every version it passes through.
+//
+// QUndoStack can replay *state*, but only by mutating the live document, so
+// showing an old version side-by-side with the current one is impossible from
+// the stack alone. This subclass solves that by photographing the document at
+// the one moment each version is guaranteed to be on screen: just before the
+// next command is pushed. Combined with a capture of wherever the stack lands
+// after undo/redo, every reachable version ends up with a snapshot.
+class HistoryStack : public QUndoStack
+{
+    Q_OBJECT
+public:
+    explicit HistoryStack(QObject* parent = nullptr) : QUndoStack(parent) {}
+
+    void setDocument(Document* d) { m_doc = d; }
+
+    // Photographs the current version, then pushes. Index i in the snapshot map
+    // means "the document after i commands", so index 0 is the original.
+    void push(QUndoCommand* cmd);
+
+    // Records the document as it looks right now under the stack's current
+    // index. Cheap no-op if that version is already known.
+    void snapshotCurrent();
+
+    // Null image if this version was never recorded (e.g. it aged out of the
+    // undo limit before the panel was ever opened).
+    QImage snapshotAt(int index) const { return m_snaps.value(index); }
+
+private:
+    // Commands pushed while the stack is not at its tip drop every redoable
+    // command — their snapshots become unreachable and must go with them.
+    void dropSnapshotsAbove(int index);
+
+    Document* m_doc = nullptr;
+    QHash<int, QImage> m_snaps;
+};
 
 class Document : public QObject
 {
@@ -28,7 +69,7 @@ public:
     int activeIndex = 0;
     bool maskEditing = false;               // painting targets active layer's mask
 
-    QUndoStack undo;
+    HistoryStack undo;
 
     // ruler guides (doc coords); not undoable, saved with the project
     QList<double> guidesH;   // horizontal lines (y values)

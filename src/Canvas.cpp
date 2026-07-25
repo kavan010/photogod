@@ -60,9 +60,11 @@ void Canvas::updateCursor()
     case ToolType::Move:      setCursor(Qt::SizeAllCursor); break;
     case ToolType::Zoom:      setCursor(Qt::PointingHandCursor); break;
     case ToolType::Text:      setCursor(Qt::IBeamCursor); break;
+    // Blank the real cursor only when the painted brush ring is there to stand
+    // in for it; otherwise the pointer would simply vanish over the canvas.
     case ToolType::Brush:
     case ToolType::Eraser:
-    case ToolType::Blur:      setCursor(Qt::BlankCursor); break;
+    case ToolType::Blur:      setCursor(m_haveHover ? Qt::BlankCursor : Qt::CrossCursor); break;
     default:                  setCursor(Qt::CrossCursor); break;
     }
 }
@@ -110,6 +112,21 @@ void Canvas::resizeEvent(QResizeEvent*)
 void Canvas::leaveEvent(QEvent*)
 {
     m_haveHover = false;
+    // Brush tools hide the real cursor and draw a ring instead. With the ring
+    // gone there would be nothing to see, so restore a normal pointer until the
+    // mouse comes back.
+    updateCursor();
+    update();
+}
+
+void Canvas::enterEvent(QEnterEvent* e)
+{
+    // Seed the hover position on entry: m_haveHover used to be set only by
+    // mouseMoveEvent, so entering without moving left the brush ring unpainted
+    // while the system cursor was already blank — an invisible cursor.
+    m_haveHover = true;
+    m_hoverWidget = e->position();
+    updateCursor();
     update();
 }
 
@@ -141,12 +158,19 @@ void Canvas::paintEvent(QPaintEvent*)
     p.scale(m_zoom, m_zoom);
     p.setRenderHint(QPainter::SmoothPixmapTransform, m_zoom < 1.0);
     if (m_xf.active) {
-        p.drawImage(0, 0, m_doc->composite(m_xf.layer.get()));
+        // when floating a lifted selection, the base layer (with its hole punched) still needs to render
+        p.drawImage(0, 0, m_doc->composite(m_xf.liftedFromSelection ? nullptr : m_xf.layer.get()));
         p.save();
         p.setRenderHint(QPainter::SmoothPixmapTransform, true);
-        p.setWorldTransform(xfMatrix(), true);
         p.setClipRect(QRectF(QPointF(-1e6, -1e6), QSizeF(2e6, 2e6)));
-        p.drawImage(m_xf.srcOffset, m_xf.srcImage);
+        if (m_xf.mode == XformMode::Warp) {
+            drawWarpCells(p);
+        } else {
+            QTransform t;
+            QTransform::quadToQuad(xfSrcRectCorners(), xfCurrentQuad(), t);
+            p.setWorldTransform(t, true);
+            p.drawImage(m_xf.srcOffset, m_xf.srcImage);
+        }
         p.restore();
     } else {
         p.drawImage(0, 0, m_doc->composite());
@@ -227,21 +251,56 @@ void Canvas::paintEvent(QPaintEvent*)
 
     // transform overlay
     if (m_xf.active) {
-        auto handles = xfHandlesDoc();
-        QPolygonF box;
-        for (int i = 0; i < 4; ++i) box << docToWidget(handles[i]);
-        p.setPen(QPen(QColor(90, 160, 255), 1.5));
-        p.setBrush(Qt::NoBrush);
-        p.drawPolygon(box);
-        p.setBrush(Qt::white);
-        p.setPen(QPen(Qt::black, 1));
-        for (const auto& h : handles) {
-            QPointF w = docToWidget(h);
-            p.drawRect(QRectF(w - QPointF(4, 4), QSizeF(8, 8)));
+        QString hint;
+        if (m_xf.mode == XformMode::Warp) {
+            int n = XForm::kWarpGrid, cols = n + 1;
+            p.setPen(QPen(QColor(90, 160, 255), 1.5));
+            for (int row = 0; row <= n; ++row) {
+                QPolygonF line;
+                for (int col = 0; col <= n; ++col) line << docToWidget(m_xf.warpPts[row * cols + col]);
+                p.drawPolyline(line);
+            }
+            for (int col = 0; col <= n; ++col) {
+                QPolygonF line;
+                for (int row = 0; row <= n; ++row) line << docToWidget(m_xf.warpPts[row * cols + col]);
+                p.drawPolyline(line);
+            }
+            p.setBrush(Qt::white);
+            p.setPen(QPen(Qt::black, 1));
+            for (const auto& pt : m_xf.warpPts) {
+                QPointF w = docToWidget(pt);
+                p.drawRect(QRectF(w - QPointF(4, 4), QSizeF(8, 8)));
+            }
+            hint = "Warp: drag mesh points, Enter=apply, Esc=cancel";
+        } else {
+            QPolygonF quad = xfCurrentQuad();
+            QPolygonF box;
+            for (const auto& pt : quad) box << docToWidget(pt);
+            p.setPen(QPen(QColor(90, 160, 255), 1.5));
+            p.setBrush(Qt::NoBrush);
+            p.drawPolygon(box);
+
+            QVector<QPointF> handles;
+            if (m_xf.mode == XformMode::Free) handles = xfHandlesDoc();
+            else if (m_xf.mode == XformMode::Skew) handles = xfSkewHandles();
+            else handles = m_xf.corners;
+
+            p.setBrush(Qt::white);
+            p.setPen(QPen(Qt::black, 1));
+            for (const auto& h : handles) {
+                QPointF w = docToWidget(h);
+                p.drawRect(QRectF(w - QPointF(4, 4), QSizeF(8, 8)));
+            }
+            switch (m_xf.mode) {
+            case XformMode::Skew:        hint = "Skew: drag an edge handle, Enter=apply, Esc=cancel"; break;
+            case XformMode::Distort:     hint = "Distort: drag any corner freely, Enter=apply, Esc=cancel"; break;
+            case XformMode::Perspective: hint = "Perspective: drag a corner to keystone, Enter=apply, Esc=cancel"; break;
+            default:
+                hint = "Transform: drag=move, corners=scale (Shift=uniform), outside=rotate, Enter=apply, Esc=cancel";
+            }
         }
         p.setPen(Qt::white);
-        p.drawText(10, height() - 12,
-                   "Transform: drag=move, corners=scale (Shift=uniform), outside=rotate, Enter=apply, Esc=cancel");
+        p.drawText(10, height() - 12, hint);
     }
 
     // rulers + guides
@@ -674,6 +733,110 @@ int Canvas::hitHandle(const QPointF& widgetPos) const
     return -1;
 }
 
+QPolygonF Canvas::xfSrcRectCorners() const
+{
+    QRectF r(m_xf.srcOffset, QSizeF(m_xf.srcImage.size()));
+    return QPolygonF{r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()};
+}
+
+QPolygonF Canvas::xfCurrentQuad() const
+{
+    if (m_xf.mode == XformMode::Free)
+        return xfMatrix().map(xfSrcRectCorners());
+    if (m_xf.mode == XformMode::Warp) {
+        int n = XForm::kWarpGrid, cols = n + 1;
+        if (m_xf.warpPts.size() < cols * cols) return xfSrcRectCorners();
+        return QPolygonF{m_xf.warpPts[0], m_xf.warpPts[n],
+                         m_xf.warpPts[n * cols + n], m_xf.warpPts[n * cols]};
+    }
+    return QPolygonF(m_xf.corners);
+}
+
+QRectF Canvas::xfBoundingRect() const
+{
+    if (m_xf.mode == XformMode::Warp && !m_xf.warpPts.isEmpty())
+        return QPolygonF(m_xf.warpPts).boundingRect();
+    return xfCurrentQuad().boundingRect();
+}
+
+QVector<QPointF> Canvas::xfSkewHandles() const
+{
+    if (m_xf.corners.size() < 4) return {};
+    const auto& c = m_xf.corners;
+    return { (c[0] + c[1]) / 2.0, (c[1] + c[2]) / 2.0, (c[2] + c[3]) / 2.0, (c[3] + c[0]) / 2.0 };
+}
+
+int Canvas::hitCornerHandle(const QPointF& widgetPos) const
+{
+    QVector<QPointF> pts = (m_xf.mode == XformMode::Skew) ? xfSkewHandles() : m_xf.corners;
+    for (int i = 0; i < pts.size(); ++i)
+        if (QLineF(docToWidget(pts[i]), widgetPos).length() < 10.0)
+            return i;
+    return -1;
+}
+
+int Canvas::hitWarpHandle(const QPointF& widgetPos) const
+{
+    for (int i = 0; i < m_xf.warpPts.size(); ++i)
+        if (QLineF(docToWidget(m_xf.warpPts[i]), widgetPos).length() < 9.0)
+            return i;
+    return -1;
+}
+
+void Canvas::drawWarpCells(QPainter& p) const
+{
+    int n = XForm::kWarpGrid, cols = n + 1;
+    if (m_xf.warpPts.size() < cols * cols) return;
+    double sw = m_xf.srcImage.width(), sh = m_xf.srcImage.height();
+    for (int row = 0; row < n; ++row) {
+        for (int col = 0; col < n; ++col) {
+            QPointF sTL(m_xf.srcOffset.x() + sw * col / double(n),       m_xf.srcOffset.y() + sh * row / double(n));
+            QPointF sTR(m_xf.srcOffset.x() + sw * (col + 1) / double(n), m_xf.srcOffset.y() + sh * row / double(n));
+            QPointF sBR(m_xf.srcOffset.x() + sw * (col + 1) / double(n), m_xf.srcOffset.y() + sh * (row + 1) / double(n));
+            QPointF sBL(m_xf.srcOffset.x() + sw * col / double(n),       m_xf.srcOffset.y() + sh * (row + 1) / double(n));
+            QPolygonF srcQuad{sTL, sTR, sBR, sBL};
+
+            int i00 = row * cols + col, i10 = row * cols + col + 1;
+            int i11 = (row + 1) * cols + col + 1, i01 = (row + 1) * cols + col;
+            QPolygonF dstQuad{m_xf.warpPts[i00], m_xf.warpPts[i10], m_xf.warpPts[i11], m_xf.warpPts[i01]};
+
+            QTransform t;
+            QTransform::quadToQuad(srcQuad, dstQuad, t);
+
+            p.save();
+            QPainterPath clip;
+            clip.addPolygon(dstQuad);
+            clip.closeSubpath();
+            p.setClipPath(clip);
+            p.setWorldTransform(t, true);
+            p.drawImage(m_xf.srcOffset, m_xf.srcImage);
+            p.restore();
+        }
+    }
+}
+
+static QRect opaqueBoundingRect(const QImage& img)
+{
+    int top = -1, bottom = -1, left = img.width(), right = -1;
+    for (int y = 0; y < img.height(); ++y) {
+        const QRgb* row = reinterpret_cast<const QRgb*>(img.constScanLine(y));
+        bool rowHas = false;
+        for (int x = 0; x < img.width(); ++x) {
+            if (qAlpha(row[x]) > 0) {
+                rowHas = true;
+                if (x < left) left = x;
+                if (x > right) right = x;
+            }
+        }
+        if (rowHas) {
+            if (top < 0) top = y;
+            bottom = y;
+        }
+    }
+    if (top < 0) return QRect();
+    return QRect(QPoint(left, top), QPoint(right, bottom));
+}
+
 void Canvas::startTransform()
 {
     if (m_xf.active) return;
@@ -683,27 +846,90 @@ void Canvas::startTransform()
         return;
     }
     if (l->locked) { emit statusMessage("Layer is locked"); return; }
+
     m_xf = XForm();
     m_xf.active = true;
     m_xf.layer = l;
-    m_xf.srcImage = l->image;
-    m_xf.srcOffset = l->offset;
-    m_xf.preState = LayerState::capture(*l);
-    m_xf.center = QRectF(l->offset, QSizeF(l->image.size())).center();
-    emit statusMessage("Transform: drag to move, corners to scale, outside to rotate. Enter=apply, Esc=cancel");
+    m_xf.preState = LayerState::capture(*l);   // full pre-transform snapshot, before any hole is punched
+
+    QRect selDoc;
+    if (m_doc->hasSelection())
+        selDoc = m_doc->selection.boundingRect().toAlignedRect().intersected(l->rect()).intersected(m_doc->rect());
+
+    if (!selDoc.isEmpty()) {
+        // lift just the selected pixels; leave the rest of the layer in place with a transparent hole
+        QRect localRect = selDoc.translated(-l->offset);
+        QImage lifted = l->image.copy(localRect);
+        QImage selAlpha = m_doc->selectionMaskAlpha().copy(selDoc);
+        {
+            QPainter mp(&lifted);
+            mp.setCompositionMode(QPainter::CompositionMode_DestinationIn);
+            mp.drawImage(0, 0, selAlpha);
+        }
+        m_xf.srcImage = lifted;
+        m_xf.srcOffset = l->offset + localRect.topLeft();
+        m_xf.liftedFromSelection = true;
+
+        QPainter lp(&l->image);
+        lp.setCompositionMode(QPainter::CompositionMode_DestinationOut);
+        lp.drawImage(localRect.topLeft(), selAlpha);
+        lp.end();
+        m_doc->invalidate();
+    } else {
+        // no selection: tight-crop to the layer's actual non-transparent pixels, not the whole backing image
+        QRect bbox = opaqueBoundingRect(l->image);
+        if (bbox.isEmpty()) bbox = l->image.rect();
+        m_xf.srcImage = l->image.copy(bbox);
+        m_xf.srcOffset = l->offset + bbox.topLeft();
+        m_xf.liftedFromSelection = false;
+    }
+
+    m_xf.mode = XformMode::Free;
+    m_xf.center = QRectF(m_xf.srcOffset, QSizeF(m_xf.srcImage.size())).center();
+    m_xf.corners = QVector<QPointF>(xfSrcRectCorners());
+    emit statusMessage("Transform: drag to move, corners to scale (Shift=uniform), outside to rotate. "
+                       "Edit > Transform for Skew/Distort/Perspective/Warp. Enter=apply, Esc=cancel");
+    update();
+}
+
+void Canvas::setTransformMode(XformMode m)
+{
+    if (!m_xf.active || m_xf.mode == m) return;
+    QPolygonF cur = xfCurrentQuad();
+    m_xf.mode = m;
+    m_xf.dragMode = 0;
+    m_xf.handleIdx = -1;
+    m_xf.warpDragIdx = -1;
+    if (m == XformMode::Warp) {
+        int n = XForm::kWarpGrid, cols = n + 1;
+        m_xf.warpPts.assign(cols * cols, QPointF());
+        for (int row = 0; row <= n; ++row) {
+            double v = row / double(n);
+            QPointF left  = cur[0] + (cur[3] - cur[0]) * v;
+            QPointF right = cur[1] + (cur[2] - cur[1]) * v;
+            for (int col = 0; col <= n; ++col) {
+                double u = col / double(n);
+                m_xf.warpPts[row * cols + col] = left + (right - left) * u;
+            }
+        }
+    } else {
+        m_xf.corners = QVector<QPointF>(cur);
+    }
     update();
 }
 
 void Canvas::commitTransform()
 {
     if (!m_xf.active) return;
-    QTransform m = xfMatrix();
-    if (m.isIdentity()) {
+
+    bool freeIdentity = (m_xf.mode == XformMode::Free) && xfMatrix().isIdentity();
+    if (freeIdentity && !m_xf.liftedFromSelection) {
         m_xf.active = false;
         update();
         return;
     }
-    QRectF b = m.mapRect(QRectF(m_xf.srcOffset, QSizeF(m_xf.srcImage.size())));
+
+    QRectF b = xfBoundingRect();
     QSize ns(std::max(1, int(std::ceil(b.width()))), std::max(1, int(std::ceil(b.height()))));
     QImage out(ns, QImage::Format_ARGB32_Premultiplied);
     out.fill(Qt::transparent);
@@ -711,13 +937,29 @@ void Canvas::commitTransform()
     p.setRenderHint(QPainter::Antialiasing);
     p.setRenderHint(QPainter::SmoothPixmapTransform);
     p.translate(-b.topLeft());
-    p.setWorldTransform(m, true);
-    p.drawImage(m_xf.srcOffset, m_xf.srcImage);
+    if (m_xf.mode == XformMode::Warp) {
+        drawWarpCells(p);
+    } else {
+        QTransform t;
+        QTransform::quadToQuad(xfSrcRectCorners(), xfCurrentQuad(), t);
+        p.setWorldTransform(t, true);
+        p.drawImage(m_xf.srcOffset, m_xf.srcImage);
+    }
     p.end();
 
     auto l = m_xf.layer;
-    l->image = out;
-    l->offset = QPoint(int(std::floor(b.left())), int(std::floor(b.top())));
+    QPoint outTopLeft(int(std::floor(b.left())), int(std::floor(b.top())));
+    if (m_xf.liftedFromSelection) {
+        QRect outRect(outTopLeft, ns);
+        l->ensureArea(outRect);
+        QPainter lp(&l->image);
+        lp.setRenderHint(QPainter::Antialiasing);
+        lp.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        lp.drawImage(outRect.topLeft() - l->offset, out);
+    } else {
+        l->image = out;
+        l->offset = outTopLeft;
+    }
     m_doc->undo.push(new LayerEditCommand(m_doc, l, m_xf.preState, "Transform"));
     m_xf.active = false;
     m_doc->invalidate();
@@ -920,24 +1162,33 @@ void Canvas::mousePressEvent(QMouseEvent* e)
 
     // transform mode captures all clicks
     if (m_xf.active) {
-        int h = hitHandle(wp);
-        m_xf.startAngle = m_xf.angle;
-        m_xf.startSx = m_xf.sx;
-        m_xf.startSy = m_xf.sy;
-        m_xf.startTrans = m_xf.trans;
-        QPointF pivot = m_xf.center + m_xf.trans;
-        if (h >= 0) {
-            m_xf.dragMode = 2;
-            m_xf.handleIdx = h;
-        } else {
-            QRectF r(m_xf.srcOffset, QSizeF(m_xf.srcImage.size()));
-            QPolygonF quad = xfMatrix().map(QPolygonF(QVector<QPointF>{r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()}));
-            if (quad.containsPoint(dp, Qt::OddEvenFill)) {
-                m_xf.dragMode = 1;
+        if (m_xf.mode == XformMode::Free) {
+            int h = hitHandle(wp);
+            m_xf.startAngle = m_xf.angle;
+            m_xf.startSx = m_xf.sx;
+            m_xf.startSy = m_xf.sy;
+            m_xf.startTrans = m_xf.trans;
+            QPointF pivot = m_xf.center + m_xf.trans;
+            if (h >= 0) {
+                m_xf.dragMode = 2;
+                m_xf.handleIdx = h;
             } else {
-                m_xf.dragMode = 3;
-                m_xf.grabAngle = qRadiansToDegrees(std::atan2(dp.y() - pivot.y(), dp.x() - pivot.x()));
+                QPolygonF quad = xfMatrix().map(xfSrcRectCorners());
+                if (quad.containsPoint(dp, Qt::OddEvenFill)) {
+                    m_xf.dragMode = 1;
+                } else {
+                    m_xf.dragMode = 3;
+                    m_xf.grabAngle = qRadiansToDegrees(std::atan2(dp.y() - pivot.y(), dp.x() - pivot.x()));
+                }
             }
+        } else if (m_xf.mode == XformMode::Warp) {
+            m_xf.warpDragIdx = hitWarpHandle(wp);
+            m_xf.warpPtsStart = m_xf.warpPts;
+            m_xf.dragMode = (m_xf.warpDragIdx >= 0) ? 5 : 0;
+        } else {
+            m_xf.handleIdx = hitCornerHandle(wp);
+            m_xf.cornersStart = m_xf.corners;
+            m_xf.dragMode = (m_xf.handleIdx >= 0) ? 4 : 0;
         }
         m_act = Act::XformDrag;
         return;
@@ -1022,8 +1273,11 @@ void Canvas::mouseMoveEvent(QMouseEvent* e)
 {
     QPointF wp = e->position();
     QPointF dp = widgetToDoc(wp);
+    const bool hadHover = m_haveHover;
     m_haveHover = true;
     m_hoverWidget = wp;
+    // Gaining hover flips brush tools from a real cursor to the painted ring.
+    if (!hadHover) updateCursor();
     emit cursorMoved(dp);
 
     switch (m_act) {
@@ -1110,6 +1364,31 @@ void Canvas::mouseMoveEvent(QMouseEvent* e)
             };
             m_xf.sx = clampS(nsx);
             m_xf.sy = clampS(nsy);
+        } else if (m_xf.dragMode == 4 && m_xf.handleIdx >= 0) {
+            QPointF delta = dp - m_dragStartDoc;
+            m_xf.corners = m_xf.cornersStart;
+            if (m_xf.mode == XformMode::Skew) {
+                static const int idxA[4] = {0, 1, 2, 3};
+                static const int idxB[4] = {1, 2, 3, 0};
+                QPointF d = delta;
+                if (m_xf.handleIdx == 0 || m_xf.handleIdx == 2) d.ry() = 0;   // top/bottom edge: horizontal shear only
+                else d.rx() = 0;                                              // left/right edge: vertical shear only
+                m_xf.corners[idxA[m_xf.handleIdx]] += d;
+                m_xf.corners[idxB[m_xf.handleIdx]] += d;
+            } else if (m_xf.mode == XformMode::Distort) {
+                m_xf.corners[m_xf.handleIdx] += delta;
+            } else if (m_xf.mode == XformMode::Perspective) {
+                static const int rowPartner[4] = {1, 0, 3, 2};   // shares horizontal edge
+                static const int colPartner[4] = {3, 2, 1, 0};   // shares vertical edge
+                int h = m_xf.handleIdx;
+                m_xf.corners[h] += delta;
+                m_xf.corners[rowPartner[h]].rx() -= delta.x();
+                m_xf.corners[colPartner[h]].ry() -= delta.y();
+            }
+        } else if (m_xf.dragMode == 5 && m_xf.warpDragIdx >= 0) {
+            QPointF delta = dp - m_dragStartDoc;
+            m_xf.warpPts = m_xf.warpPtsStart;
+            m_xf.warpPts[m_xf.warpDragIdx] = m_xf.warpPtsStart[m_xf.warpDragIdx] + delta;
         }
         break;
     }
