@@ -40,7 +40,9 @@ public:
     QPointF widgetToDoc(const QPointF& p) const { return (p - m_pan) / m_zoom; }
 
 signals:
-    void colorPicked(const QColor& c);
+    // commit=false for the live preview while the eyedropper is dragged;
+    // the final pick (mouse release) comes through with commit=true.
+    void colorPicked(const QColor& c, bool commit = true);
     void zoomChanged(double z);
     void cursorMoved(const QPointF& docPos);
     void statusMessage(const QString& msg);
@@ -60,7 +62,7 @@ protected:
     void enterEvent(QEnterEvent*) override;
 
 private:
-    enum class Act { None, Stroke, Marquee, Lasso, ShapeDrag, GradDrag, MoveLayer, PanView, CropDrag, XformDrag, GuideDrag };
+    enum class Act { None, Stroke, Marquee, Lasso, ShapeDrag, GradDrag, MoveLayer, PanView, CropDrag, XformDrag, GuideDrag, Pick };
     enum class SelCombine { Replace, Add, Subtract };
 
     QTransform viewTransform() const;
@@ -82,7 +84,7 @@ private:
     // text
     void textToolClick(const QPointF& docPos);
 
-    void pickColor(const QPointF& docPos);
+    void pickColor(const QPointF& docPos, bool commit = true);
     void updateCursor();
 
     // rulers / guides / snapping

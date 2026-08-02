@@ -1,4 +1,5 @@
 #include "HistoryPanel.h"
+#include "Theme.h"
 #include "Document.h"
 #include <QUndoGroup>
 #include <QUndoStack>
@@ -36,10 +37,10 @@ InstantHint::InstantHint(QWidget* parent) : QWidget(parent, Qt::ToolTip | Qt::Fr
     lay->addWidget(m_title);
     lay->addWidget(m_body);
 
-    setStyleSheet(R"(
-        #hintTitle { color: #f2f2f6; font-size: 11px; font-weight: 700; }
-        #hintBody  { color: #a4a4b0; font-size: 11px; }
-    )");
+    setStyleSheet(QString(R"(
+        #hintTitle { color: %TEXT%; font-size: 12px; }
+        #hintBody  { color: %TEXT2%; font-size: 12px; }
+    )").replace("%TEXT2%", Theme::Text2).replace("%TEXT%", Theme::Text));
 }
 
 InstantHint* InstantHint::instance()
@@ -81,8 +82,8 @@ void InstantHint::paintEvent(QPaintEvent*)
 {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
-    p.setPen(QPen(QColor("#3d3d48"), 1));
-    p.setBrush(QColor("#26262c"));
+    p.setPen(QPen(Theme::color(Theme::Line), 1));
+    p.setBrush(Theme::color(Theme::Raised));
     p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 7, 7);
 }
 
@@ -199,9 +200,11 @@ void HistoryRow::setState(bool isCurrent, bool isUndone)
     m_current = isCurrent;
     m_undone = isUndone;
     // Undone entries read as "ahead of you" — dimmed, like a git log past HEAD.
-    m_label->setStyleSheet(QString("color: %1; font-weight: %2;")
-                               .arg(isUndone ? "#5e5e68" : (isCurrent ? "#f2f2f6" : "#c2c2cc"),
-                                    isCurrent ? "700" : "400"));
+    // Where you are is shown by tone and by the row's own fill — never by
+    // thickening the text.
+    m_label->setStyleSheet(QString("color: %1; font-weight: 400;")
+                               .arg(isUndone ? Theme::Text4
+                                             : (isCurrent ? Theme::Text : Theme::Text2)));
     // Reverting to where you already are is a no-op; say so by disabling it.
     m_revert->setEnabled(!isCurrent);
     update();
@@ -239,11 +242,11 @@ void HistoryRow::paintEvent(QPaintEvent*)
     p.setRenderHint(QPainter::Antialiasing);
 
     if (m_current) {
-        p.setBrush(QColor("#242c3d"));
+        p.setBrush(Theme::color(Theme::AccentWash));
         p.setPen(Qt::NoPen);
         p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6);
     } else if (m_expanded) {
-        p.setBrush(QColor("#202024"));
+        p.setBrush(Theme::color(Theme::Raised));
         p.setPen(Qt::NoPen);
         p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6);
     }
@@ -252,10 +255,10 @@ void HistoryRow::paintEvent(QPaintEvent*)
     // reads as a chain of versions rather than a flat list of words.
     const int cx = 17;
     const int cy = 14;
-    p.setPen(QPen(QColor(m_undone ? "#2e2e36" : "#3c3c46"), 1.5));
+    p.setPen(QPen(Theme::color(m_undone ? Theme::LineSoft : Theme::Line), 1.5));
     p.drawLine(cx, 0, cx, height());
     p.setPen(Qt::NoPen);
-    p.setBrush(QColor(m_current ? "#4f7cff" : (m_undone ? "#3a3a44" : "#5a5a66")));
+    p.setBrush(Theme::color(m_current ? Theme::Accent : (m_undone ? Theme::Text4 : Theme::Text3)));
     p.drawEllipse(QPointF(cx, cy), m_current ? 4.5 : 3.2, m_current ? 4.5 : 3.2);
 }
 
@@ -290,23 +293,31 @@ HistoryPanel::HistoryPanel(QUndoGroup* group, QWidget* parent)
     m_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     lay->addWidget(m_scroll, 1);
 
-    setStyleSheet(R"(
-        #histScroll, #histInner { background: #1c1c1e; border: none; }
-        #histEmpty { color: #6a6a74; font-size: 11px; padding: 14px 0; }
-        #histLabel { color: #c2c2cc; font-size: 11px; }
-        #histNote  { color: #6a6a74; font-size: 10px; }
-        #histRevert { background: transparent; border: 1px solid transparent;
-                      border-radius: 5px; color: #8a8a96; font-size: 13px; padding: 0; }
-        #histRevert:hover { background: #34343e; border-color: #4a4a56; color: #f0f0f4; }
-        #histRevert:pressed { background: #3d3d4a; }
-        #histRevert:disabled { color: #3a3a44; background: transparent;
-                               border-color: transparent; }
-        #histThumb { background: #141416; border: 1px solid #2c2c33;
-                     border-radius: 5px; color: #5a5a64; font-size: 10px; padding: 3px; }
-        #histSee { background: #2c2c33; border: 1px solid #3a3a44; border-radius: 5px;
-                   padding: 4px 10px; color: #dcdce4; font-size: 11px; }
-        #histSee:hover { background: #35353e; border-color: #4a4a58; }
-    )");
+    setStyleSheet(QString(R"(
+        #histScroll, #histInner { background: transparent; border: none; }
+        #histEmpty { color: %TEXT3%; font-size: 12px; padding: 16px 0; }
+        #histLabel { color: %TEXT2%; font-size: 12px; }
+        #histNote  { color: %TEXT3%; font-size: 11px; }
+        #histRevert { background: transparent; border: none;
+                      border-radius: 6px; color: %TEXT3%; font-size: 13px; padding: 0; }
+        #histRevert:hover { background: %HOVER%; color: %TEXT%; }
+        #histRevert:pressed { background: %ACTIVE%; }
+        #histRevert:disabled { color: %TEXT4%; background: transparent; }
+        #histThumb { background: %VOID%; border: 1px solid %LINE%;
+                     border-radius: 6px; color: %TEXT4%; font-size: 11px; padding: 3px; }
+        #histSee { background: %RAISED%; border: none; border-radius: 6px;
+                   padding: 5px 12px; color: %TEXT2%; font-size: 12px; }
+        #histSee:hover { background: %HOVER%; color: %TEXT%; }
+    )")
+        .replace("%VOID%",   Theme::Void)
+        .replace("%RAISED%", Theme::Raised)
+        .replace("%HOVER%",  Theme::Hover)
+        .replace("%ACTIVE%", Theme::Active)
+        .replace("%LINE%",   Theme::Line)
+        .replace("%TEXT2%",  Theme::Text2)
+        .replace("%TEXT3%",  Theme::Text3)
+        .replace("%TEXT4%",  Theme::Text4)
+        .replace("%TEXT%",   Theme::Text));
     m_scroll->hide();
 
     connect(m_group, &QUndoGroup::indexChanged, this, [this](int) {
@@ -437,13 +448,14 @@ void HistoryPanel::showComparison(int index)
                       "Nothing here changes your document.")
                   .arg(index).arg(cur));
     caption->setWordWrap(true);
-    caption->setStyleSheet("color: #9a9aa6; font-size: 11px;");
+    caption->setStyleSheet(QString("color: %1; font-size: 12px;").arg(Theme::Text2));
     lay->addWidget(caption);
 
     auto* view = new QLabel;
     view->setAlignment(Qt::AlignCenter);
     view->setMinimumHeight(380);
-    view->setStyleSheet("background: #141416; border: 1px solid #2c2c33; border-radius: 6px;");
+    view->setStyleSheet(QString("background: %1; border: 1px solid %2; border-radius: 8px;")
+                            .arg(Theme::Void, Theme::Line));
     lay->addWidget(view, 1);
 
     auto* wipe = new QSlider(Qt::Horizontal);
@@ -453,7 +465,7 @@ void HistoryPanel::showComparison(int index)
 
     auto* ctrls = new QHBoxLayout;
     auto* lbl = new QLabel("Wipe");
-    lbl->setStyleSheet("color: #9a9aa6; font-size: 11px;");
+    lbl->setStyleSheet(QString("color: %1; font-size: 12px;").arg(Theme::Text2));
     ctrls->addWidget(lbl);
     ctrls->addWidget(wipe, 1);
     ctrls->addWidget(diffBox);
@@ -472,7 +484,7 @@ void HistoryPanel::showComparison(int index)
         if (before.isNull() && now.isNull()) return;
         const QSize sz = now.isNull() ? before.size() : now.size();
         QImage out(sz, QImage::Format_ARGB32_Premultiplied);
-        out.fill(QColor("#141416"));
+        out.fill(Theme::color(Theme::Void));
         QPainter p(&out);
 
         if (!now.isNull()) p.drawImage(0, 0, now);
@@ -480,7 +492,7 @@ void HistoryPanel::showComparison(int index)
             const int split = sz.width() * wipe->value() / 100;
             p.drawImage(QRect(0, 0, split, sz.height()), before,
                         QRect(0, 0, split, before.height()));
-            p.setPen(QPen(QColor("#4f7cff"), 2));
+            p.setPen(QPen(Theme::color(Theme::Accent), 2));
             p.drawLine(split, 0, split, sz.height());
         }
 

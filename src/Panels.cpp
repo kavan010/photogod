@@ -1,4 +1,6 @@
 #include "Panels.h"
+#include "Theme.h"
+#include "IconGlow.h"
 #include "Commands.h"
 #include "Dialogs.h"
 #include <QListWidget>
@@ -18,6 +20,7 @@
 #include <QColorDialog>
 #include <QPainter>
 #include <QMouseEvent>
+#include <QApplication>
 #include <QAbstractItemModel>
 #include <QRandomGenerator>
 #include <QSet>
@@ -122,41 +125,32 @@ ColorPanel::ColorPanel(ToolSettings* ts, QWidget* parent) : QWidget(parent), m_t
     lay->setContentsMargins(6, 6, 6, 6);
     lay->setSpacing(6);
 
-    // fg/bg swatches
-    auto* row = new QHBoxLayout;
-    m_fgBtn = new QToolButton;
-    m_fgBtn->setFixedSize(38, 30);
+    // fg/bg swatches: Photoshop-style overlapping pair, foreground in front
+    auto* swatchBox = new QWidget;
+    swatchBox->setFixedSize(52, 52);
+    m_bgBtn = new QToolButton(swatchBox);
+    m_bgBtn->setGeometry(18, 18, 34, 34);
+    m_bgBtn->setToolTip("Background color — click to make it the foreground (X)");
+    m_fgBtn = new QToolButton(swatchBox);
+    m_fgBtn->setGeometry(0, 0, 34, 34);
     m_fgBtn->setToolTip("Foreground color");
-    m_bgBtn = new QToolButton;
-    m_bgBtn->setFixedSize(38, 30);
-    m_bgBtn->setToolTip("Background color (click to change)");
-    auto* swap = new QToolButton;
-    swap->setText("⇄");
-    swap->setToolTip("Swap colors (X)");
-    row->addWidget(m_fgBtn);
-    row->addWidget(m_bgBtn);
-    row->addWidget(swap);
-    row->addStretch();
-    lay->addLayout(row);
+    m_fgBtn->raise();
 
-    connect(m_fgBtn, &QToolButton::clicked, this, [this] {
-        QColor c = QColorDialog::getColor(m_ts->fg, this, "Foreground Color");
-        if (c.isValid()) setFg(c);
-    });
-    connect(m_bgBtn, &QToolButton::clicked, this, [this] {
-        QColor c = QColorDialog::getColor(m_ts->bg, this, "Background Color");
-        if (c.isValid()) {
-            m_ts->bg = c;
-            refresh();
-            emit colorsChanged();
-        }
-    });
-    connect(swap, &QToolButton::clicked, this, [this] { swapColors(); });
+    auto* swatchCol = new QVBoxLayout;
+    swatchCol->setContentsMargins(0, 0, 0, 0);
+    swatchCol->setSpacing(2);
+    swatchCol->addWidget(swatchBox);
+    swatchCol->addStretch();
 
-    // SV square + hue bar
+    // Clicking the back swatch just swaps — no dialog. The front one is already
+    // the colour being edited by the picker below, so it has nothing to do.
+    connect(m_bgBtn, &QToolButton::clicked, this, [this] { swapColors(); });
+
+    // swatches + SV square + hue bar
     auto* pickRow = new QHBoxLayout;
     m_sv = new SVSquare;
     m_hue = new HueBar;
+    pickRow->addLayout(swatchCol);
     pickRow->addWidget(m_sv, 1);
     pickRow->addWidget(m_hue);
     lay->addLayout(pickRow);
@@ -261,8 +255,10 @@ void ColorPanel::applyHsv(bool notifyRecent)
 
 void ColorPanel::refresh()
 {
-    m_fgBtn->setStyleSheet(QString("background:%1; border:1px solid #55555c; border-radius:4px;").arg(m_ts->fg.name()));
-    m_bgBtn->setStyleSheet(QString("background:%1; border:1px solid #55555c; border-radius:4px;").arg(m_ts->bg.name()));
+    m_fgBtn->setStyleSheet(QString("background:%1; border:1px solid %2; border-radius:5px;")
+                               .arg(m_ts->fg.name(), Theme::Line));
+    m_bgBtn->setStyleSheet(QString("background:%1; border:1px solid %2; border-radius:5px;")
+                               .arg(m_ts->bg.name(), Theme::Line));
     m_updating = true;
     m_r->setValue(m_ts->fg.red());
     m_g->setValue(m_ts->fg.green());
@@ -271,9 +267,11 @@ void ColorPanel::refresh()
     m_updating = false;
     for (int i = 0; i < m_recentBtns.size(); ++i) {
         if (i < m_recent.size())
-            m_recentBtns[i]->setStyleSheet(QString("background:%1; border:1px solid #4a4a50; border-radius:3px;").arg(m_recent[i].name()));
+            m_recentBtns[i]->setStyleSheet(QString("background:%1; border:1px solid %2; border-radius:4px;")
+                                               .arg(m_recent[i].name(), Theme::Line));
         else
-            m_recentBtns[i]->setStyleSheet("background:transparent; border:1px solid #313136; border-radius:3px;");
+            m_recentBtns[i]->setStyleSheet(QString("background:transparent; border:1px solid %1; border-radius:4px;")
+                                               .arg(Theme::LineSoft));
     }
 }
 
@@ -284,11 +282,11 @@ void ColorPanel::addRecent(const QColor& c)
     while (m_recent.size() > 8) m_recent.removeLast();
 }
 
-void ColorPanel::setFg(const QColor& c)
+void ColorPanel::setFg(const QColor& c, bool commit)
 {
     m_ts->fg = c;
     syncFromColor(c);
-    addRecent(c);
+    if (commit) addRecent(c);
     refresh();
     emit colorsChanged();
 }
@@ -309,22 +307,24 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent)
     lay->setContentsMargins(4, 4, 4, 4);
     lay->setSpacing(4);
 
+    // blend mode and opacity share one row
     auto* topRow = new QHBoxLayout;
+    topRow->setSpacing(6);
     m_blend = new QComboBox;
     m_blend->addItems(blendModeNames());
-    topRow->addWidget(m_blend, 1);
-    lay->addLayout(topRow);
-
-    auto* opRow = new QHBoxLayout;
-    opRow->addWidget(new QLabel("Opacity"));
+    m_blend->setToolTip("Blend mode");
     m_opacity = new QSlider(Qt::Horizontal);
     m_opacity->setRange(0, 100);
     m_opacity->setValue(100);
+    m_opacity->setToolTip("Layer opacity");
+    m_opacity->setMinimumWidth(60);
     m_opacityLabel = new QLabel("100%");
     m_opacityLabel->setMinimumWidth(38);
-    opRow->addWidget(m_opacity, 1);
-    opRow->addWidget(m_opacityLabel);
-    lay->addLayout(opRow);
+    m_opacityLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    topRow->addWidget(m_blend, 3);
+    topRow->addWidget(m_opacity, 2);
+    topRow->addWidget(m_opacityLabel);
+    lay->addLayout(topRow);
 
     m_list = new QListWidget;
     m_list->setDragDropMode(QAbstractItemView::InternalMove);
@@ -351,8 +351,9 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent)
 
     auto* btnRow = new QHBoxLayout;
     btnRow->setSpacing(1);
-    for (auto* b : {m_btnAdd, m_btnAdj, m_btnDup, m_btnMask, m_btnDelMask,
-                    m_btnEditMask, m_btnMerge, m_btnDel})
+    btnRow->addStretch();
+    for (auto* b : {m_btnAdj, m_btnDup, m_btnMask, m_btnDelMask,
+                    m_btnEditMask, m_btnMerge, m_btnAdd, m_btnDel})
         btnRow->addWidget(b);
     btnRow->addStretch();
     lay->addLayout(btnRow);
@@ -519,6 +520,29 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent)
     });
 }
 
+bool LayersPanel::eventFilter(QObject* obj, QEvent* ev)
+{
+    switch (ev->type()) {
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseMove:
+    case QEvent::MouseButtonRelease:
+    case QEvent::MouseButtonDblClick: {
+        auto* w = qobject_cast<QWidget*>(obj);
+        if (!w || !m_list || !m_list->viewport()->isAncestorOf(w)) break;
+        auto* me = static_cast<QMouseEvent*>(ev);
+        QWidget* vp = m_list->viewport();
+        QMouseEvent copy(me->type(), vp->mapFromGlobal(me->globalPosition()),
+                         me->globalPosition(), me->button(), me->buttons(),
+                         me->modifiers());
+        QApplication::sendEvent(vp, &copy);
+        return true;
+    }
+    default:
+        break;
+    }
+    return QWidget::eventFilter(obj, ev);
+}
+
 void LayersPanel::handleReorder()
 {
     if (!m_doc || m_updating) return;
@@ -598,6 +622,9 @@ void LayersPanel::rebuild()
             m_list->addItem(it);
 
             auto* w = new QWidget;
+            // The row widget covers the item, so the view would never see the
+            // press that starts a drag; eventFilter() relays it to the viewport.
+            w->installEventFilter(this);
             auto* h = new QHBoxLayout(w);
             h->setContentsMargins(2, 2, 4, 2);
             h->setSpacing(4);
@@ -611,6 +638,7 @@ void LayersPanel::rebuild()
             eye->setIcon(eyeIcon);
             eye->setChecked(l->visible);
             eye->setToolTip("Show/hide layer");
+            IconGlow::installToggle(eye, ":/icons/eye.svg", ":/icons/eye-off.svg");
             std::weak_ptr<Layer> wl = l;
             connect(eye, &QToolButton::toggled, this, [this, wl](bool on) {
                 if (m_updating) return;
@@ -624,6 +652,7 @@ void LayersPanel::rebuild()
             thumb->setPixmap(QPixmap::fromImage(l->thumbnail(m_doc->size())));
             thumb->setFixedSize(62, 42);
             thumb->setAlignment(Qt::AlignCenter);
+            thumb->setAttribute(Qt::WA_TransparentForMouseEvents);
             m_thumbLabels.prepend(thumb);   // keep index aligned with layer order later
 
             QString suffix;
@@ -632,6 +661,7 @@ void LayersPanel::rebuild()
             if (l->hasMask()) suffix += " <span style='color:#888'>[mask]</span>";
             auto* name = new QLabel(l->name.toHtmlEscaped() + suffix);
             name->setTextFormat(Qt::RichText);
+            name->setAttribute(Qt::WA_TransparentForMouseEvents);
 
             auto* lock = new QToolButton;
             lock->setAutoRaise(true);
@@ -642,6 +672,7 @@ void LayersPanel::rebuild()
             lock->setIcon(lockIcon);
             lock->setChecked(l->locked);
             lock->setToolTip("Lock/unlock layer");
+            IconGlow::installToggle(lock, ":/icons/lock.svg", ":/icons/unlock.svg");
             connect(lock, &QToolButton::toggled, this, [this, wl](bool on) {
                 if (m_updating) return;
                 if (auto lp = wl.lock()) lp->locked = on;
@@ -703,7 +734,7 @@ static const BrushPreset kBrushPresets[] = {
 static QImage brushPresetThumb(const BrushPreset& bp)
 {
     QImage img(64, 40, QImage::Format_ARGB32_Premultiplied);
-    img.fill(QColor(50, 50, 54));
+    img.fill(Theme::color(Theme::Active));
     QPainter p(&img);
     p.setRenderHint(QPainter::Antialiasing);
     auto* rng = QRandomGenerator::global();
@@ -768,7 +799,11 @@ AdjustmentsPanel::AdjustmentsPanel(QWidget* parent) : QWidget(parent)
 {
     auto* lay = new QVBoxLayout(this);
     lay->setContentsMargins(6, 6, 6, 6);
-    lay->addWidget(new QLabel("<b>Add adjustment layer</b>"));
+    {
+        auto* heading = new QLabel("Add adjustment layer");
+        heading->setStyleSheet(QString("color: %1; font-size: 12px;").arg(Theme::Text3));
+        lay->addWidget(heading);
+    }
     auto* grid = new QGridLayout;
     grid->setSpacing(4);
 
@@ -810,8 +845,8 @@ LevelsHistogram::LevelsHistogram(const QVector<int>& bins, std::shared_ptr<Layer
 void LevelsHistogram::paintEvent(QPaintEvent*)
 {
     QPainter p(this);
-    p.fillRect(rect(), QColor(24, 24, 26));
-    p.setPen(QColor(70, 70, 75));
+    p.fillRect(rect(), Theme::color(Theme::Void));
+    p.setPen(Theme::color(Theme::Text4));
     p.drawRect(0, 0, width() - 1, height() - 1);
 
     int maxBin = 1;
@@ -873,12 +908,14 @@ void PropertiesPanel::rebuild()
     } else {
         QString type = l->type == Layer::Text ? "Text layer"
                      : l->type == Layer::Adjustment ? "Adjustment layer" : "Raster layer";
-        auto* title = new QLabel(QString("<b>%1</b><br><span style='color:#999'>%2</span>")
-                                     .arg(l->name.toHtmlEscaped(), type));
+        auto* title = new QLabel(
+            QString("<span style='font-size:15px; color:%1'>%2</span>"
+                    "<br><span style='color:%3'>%4</span>")
+                .arg(Theme::Text, l->name.toHtmlEscaped(), Theme::Text3, type));
         lay->addWidget(title);
 
         if (l->type == Layer::Raster && !l->image.isNull()) {
-            lay->addWidget(new QLabel(QString("Size: %1 x %2  Offset: %3, %4")
+            lay->addWidget(new QLabel(QString("%1 × %2   at %3, %4")
                                           .arg(l->image.width()).arg(l->image.height())
                                           .arg(l->offset.x()).arg(l->offset.y())));
         }

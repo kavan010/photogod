@@ -1,4 +1,5 @@
 #include "CommandPalette.h"
+#include "Theme.h"
 #include <QLineEdit>
 #include <QListWidget>
 #include <QLabel>
@@ -61,7 +62,7 @@ constexpr int kRoleDetail   = Qt::UserRole + 3;
 constexpr int kRoleIndex    = Qt::UserRole + 4;
 constexpr int kRoleEnabled  = Qt::UserRole + 5;
 
-constexpr int kRowHeight = 30;
+constexpr int kRowHeight = 34;
 
 // Draws: [category chip] Title .................... detail
 class RowDelegate : public QStyledItemDelegate
@@ -87,11 +88,11 @@ public:
         if (selected) {
             QPainterPath bg;
             bg.addRoundedRect(r, 6, 6);
-            p->fillPath(bg, QColor("#34435f"));
+            p->fillPath(bg, Theme::color(Theme::AccentWash));
         } else if (hovered) {
             QPainterPath bg;
             bg.addRoundedRect(r, 6, 6);
-            p->fillPath(bg, QColor("#26262b"));
+            p->fillPath(bg, Theme::color(Theme::Hover));
         }
 
         int x = r.left() + 10;
@@ -109,8 +110,8 @@ public:
             QRect chip(x, r.center().y() - 8, cw, 16);
             QPainterPath cp;
             cp.addRoundedRect(chip, 4, 4);
-            p->fillPath(cp, QColor(selected ? "#4a5b7d" : "#2b2b31"));
-            p->setPen(QColor(enabled ? (selected ? "#cbd6ee" : "#8a8a95") : "#5c5c64"));
+            p->fillPath(cp, Theme::color(selected ? Theme::AccentDim : Theme::Active));
+            p->setPen(Theme::color(enabled ? (selected ? Theme::Text : Theme::Text3) : Theme::Text4));
             p->drawText(chip, Qt::AlignCenter, cat);
             x = chip.right() + 10;
         }
@@ -125,7 +126,7 @@ public:
             QFontMetrics dfm(df);
             int dw = dfm.horizontalAdvance(detail);
             QRect dr(rightEdge - dw, r.top(), dw, r.height());
-            p->setPen(QColor(selected ? "#a9b6d2" : "#6f6f79"));
+            p->setPen(Theme::color(selected ? Theme::Accent : Theme::Text3));
             p->drawText(dr, Qt::AlignVCenter | Qt::AlignRight, detail);
             rightEdge = dr.left() - 12;
         }
@@ -133,7 +134,7 @@ public:
         // title
         QFont tf = opt.font;
         p->setFont(tf);
-        p->setPen(QColor(enabled ? (selected ? "#ffffff" : "#dcdce2") : "#63636b"));
+        p->setPen(Theme::color(enabled ? (selected ? Theme::Text : Theme::Text2) : Theme::Text4));
         QRect tr(x, r.top(), std::max(10, rightEdge - x), r.height());
         QString title = QFontMetrics(tf).elidedText(idx.data(kRoleTitle).toString(),
                                                     Qt::ElideRight, tr.width());
@@ -187,27 +188,32 @@ CommandPalette::CommandPalette(QWidget* parent)
     m_hint->setObjectName("paletteHint");
     lay->addWidget(m_hint);
 
-    card->setStyleSheet(R"(
-        #paletteCard { background: #232327; border: 1px solid #3a3a44; border-radius: 10px; }
+    card->setStyleSheet(QString(R"(
+        #paletteCard { background: %RAISED%; border: 1px solid %LINE%; border-radius: 12px; }
         #paletteInput {
             background: transparent; border: none;
-            border-bottom: 1px solid #33333b; border-radius: 0;
-            padding: 10px 12px; color: #ecedf2; font-size: 14px;
-            selection-background-color: #4f7cff;
+            border-bottom: 1px solid %LINE%; border-radius: 0;
+            padding: 14px 16px; color: %TEXT%; font-size: 16px;
+            selection-background-color: %ACCENTDIM%;
         }
-        #paletteList { background: transparent; border: none; outline: none; padding: 4px 2px; }
+        #paletteList { background: transparent; border: none; outline: none; padding: 6px 4px; }
         #paletteHint {
-            color: #6a6a74; font-size: 10px; padding: 5px 12px;
-            border-top: 1px solid #2c2c34;
+            color: %TEXT3%; font-size: 11px; padding: 8px 16px;
+            border-top: 1px solid %LINE%;
         }
-    )");
+    )")
+        .replace("%RAISED%",    Theme::Raised)
+        .replace("%LINE%",      Theme::Line)
+        .replace("%TEXT3%",     Theme::Text3)
+        .replace("%TEXT%",      Theme::Text)
+        .replace("%ACCENTDIM%", Theme::AccentDim));
 
     connect(m_input, &QLineEdit::textChanged, this, [this] { refilter(); });
     connect(m_input, &QLineEdit::returnPressed, this, [this] { accept(); });
     connect(m_list, &QListWidget::itemClicked, this, [this](QListWidgetItem*) { accept(); });
 
     m_input->installEventFilter(this);
-    setFixedWidth(620);
+    setFixedWidth(680);
 }
 
 void CommandPalette::setProvider(std::function<QList<PaletteCommand>()> provider)
@@ -306,7 +312,7 @@ void CommandPalette::refilter()
                             .arg(m_list->count()).arg(m_list->count() == 1 ? "" : "s"));
 
     adjustSize();
-    setFixedWidth(620);
+    setFixedWidth(680);
 }
 
 void CommandPalette::moveSelection(int delta)

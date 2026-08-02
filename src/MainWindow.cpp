@@ -5,19 +5,22 @@
 #include "Commands.h"
 #include "HomePage.h"
 #include "CommandPalette.h"
-#include "DockTitleBar.h"
+#include "Theme.h"
+#include "IconGlow.h"
+#include "Dock.h"
 #include "HistoryPanel.h"
 #include <QPointer>
 #include <QSettings>
-#include <QDockWidget>
+#include <QJsonDocument>
+#include <QSplitter>
 #include <QTabWidget>
 #include <QTabBar>
+#include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
 #include <QStackedWidget>
 #include <QMenuBar>
 #include <QStatusBar>
-#include <QDockWidget>
 #include <QUndoView>
 #include <QLabel>
 #include <QSlider>
@@ -52,14 +55,6 @@ MainWindow::MainWindow()
     m_tabs->setMovable(true);
     m_tabs->setDocumentMode(true);
 
-    // tabbed dock panels show their selector on top, not at the bottom
-    setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
-    // DockTitleBar drives dragging itself (Photoshop-style tab handles + drop
-    // hints), so Qt's own GroupedDragging rubber-band stays off — two drag
-    // systems on one press fight each other.
-    setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowTabbedDocks
-                   | QMainWindow::AllowNestedDocks);
-
     m_home = new HomePage;
     connect(m_home, &HomePage::newRequested, this, [this] { newDocument(); });
     connect(m_home, &HomePage::openRequested, this, [this] {
@@ -73,10 +68,20 @@ MainWindow::MainWindow()
 
     m_central = new QStackedWidget;
     m_central->addWidget(m_home);   // index 0
-    m_central->addWidget(m_tabs);   // index 1
     setCentralWidget(m_central);
+
+    // The workspace. The canvas is itself a panel — a pinned one at the root of
+    // the dock tree — so tools can be snapped to any side of it, or to each
+    // other, without the canvas ever being a special case in the layout code.
+    m_dock = new DockManager(this);
+    m_central->addWidget(m_dock->mainArea());   // index 1
+
     connect(m_tabs, &QTabWidget::tabCloseRequested, this, [this](int i) { closeTab(i); });
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
+        // One document needs no tab to pick it out of. The strip appears the
+        // moment there is a second, and gets out of the way again after.
+        m_tabs->tabBar()->setVisible(m_tabs->count() > 1);
+
         Document* doc = currentDoc();
         m_layers->setDocument(doc);
         m_props->setDocument(doc);
@@ -84,10 +89,10 @@ MainWindow::MainWindow()
         if (m_history) m_history->setDocument(doc);
         if (doc) {
             m_undoGroup.setActiveStack(&doc->undo);
-            m_statusSize->setText(QString("%1 x %2").arg(doc->width()).arg(doc->height()));
+            m_statusSize->setText(QString("%1 × %2").arg(doc->width()).arg(doc->height()));
         } else {
             m_undoGroup.setActiveStack(nullptr);
-            m_statusSize->setText("-");
+            m_statusSize->clear();
         }
         if (Canvas* c = currentCanvas()) {
             c->setTool(m_tool);
@@ -97,21 +102,36 @@ MainWindow::MainWindow()
 
     buildToolbar();
     buildOptionsBar();
+    // The starting tool is decided in the header, not here — this just walks
+    // the options bar and its sliders up to match it before anything is shown.
+    setTool(m_tool);
     buildDocks();
     buildCommandPalette();
     buildMenus();
 
-    m_statusPos = new QLabel("-");
-    m_statusZoom = new QLabel("100%");
-    m_statusSize = new QLabel("-");
-    statusBar()->addPermanentWidget(m_statusSize);
-    statusBar()->addPermanentWidget(m_statusZoom);
-    statusBar()->addWidget(m_statusPos);
-    statusBar()->showMessage("Ctrl+N new document · Ctrl+O open image · drag & drop images onto the window", 8000);
+    buildStatusBar();
 
     // start on the home screen (docks/toolbars hidden until a document is open)
     m_central->setCurrentWidget(m_home);
     updateChromeForView();
+}
+
+// A readout, not a dashboard. Canvas state only, right-aligned, in tabular
+// figures so the numbers stop twitching as they change.
+void MainWindow::buildStatusBar()
+{
+    auto* bar = statusBar();
+    bar->setSizeGripEnabled(false);
+
+    m_statusPos  = new QLabel;
+    m_statusZoom = new QLabel;
+    m_statusSize = new QLabel;
+    for (QLabel* l : {m_statusPos, m_statusZoom, m_statusSize}) {
+        l->setFont(Theme::monoFont(11));
+        l->setStyleSheet(QString("color: %1; padding: 0 10px;").arg(Theme::Text3));
+        bar->addPermanentWidget(l);
+    }
+    m_statusZoom->setText("100%");
 }
 
 MainWindow::~MainWindow()
@@ -137,35 +157,26 @@ void MainWindow::showHome()
     m_home->refresh();
     m_central->setCurrentWidget(m_home);
     updateChromeForView();
-    statusBar()->showMessage("Home — pick a recent project or start a new one", 4000);
 }
 
 void MainWindow::showEditor()
 {
-    m_central->setCurrentWidget(m_tabs);
+    m_central->setCurrentWidget(m_dock->mainArea());
     updateChromeForView();
     if (Canvas* c = currentCanvas()) c->setFocus();
 }
 
 void MainWindow::updateChromeForView()
 {
-    // the editing chrome (tool docks + toolbars) is meaningless on the start screen
-    bool onHome = (m_central->currentWidget() == m_home);
-    m_switchingView = true;
-    if (onHome) {
-        // Hide the panels, but remember the user's intent so panels they closed
-        // themselves stay closed on the way back. isVisible() is useless here —
-        // during construction the window isn't shown yet, so it reports false
-        // for everything; m_userClosed is maintained from the close signal.
-        for (QDockWidget* d : findChildren<QDockWidget*>())
-            d->hide();
-    } else {
-        for (QDockWidget* d : findChildren<QDockWidget*>())
-            if (!m_userClosed.contains(d)) d->show();
-    }
-    m_switchingView = false;
+    // The editing chrome is meaningless on the start screen. Swapping the whole
+    // workspace out of the stack takes every docked panel with it in one move —
+    // only the torn-off floating ones need telling.
+    const bool onHome = (m_central->currentWidget() == m_home);
+    m_dock->setPanelsVisible(!onHome);
     for (QToolBar* t : findChildren<QToolBar*>())
         t->setVisible(!onHome);
+    // The status bar reads out canvas state; on the start screen there is none.
+    statusBar()->setVisible(!onHome);
 }
 
 // ============================ documents / tabs ============================
@@ -176,9 +187,10 @@ void MainWindow::addDocument(Document* doc)
     doc->setParent(canvas);
     m_undoGroup.addStack(&doc->undo);
 
-    connect(canvas, &Canvas::colorPicked, this, [this](const QColor& c) {
-        m_color->setFg(c);
-        statusBar()->showMessage("Picked " + c.name(), 2000);
+    connect(canvas, &Canvas::colorPicked, this, [this](const QColor& c, bool commit) {
+        m_color->setFg(c, commit);
+        statusBar()->showMessage((commit ? "Picked " : "Sampling ") + c.name(),
+                                 commit ? 2000 : 0);
     });
     connect(canvas, &Canvas::zoomChanged, this, [this](double z) {
         m_statusZoom->setText(QString::number(int(std::lround(z * 100))) + "%");
@@ -191,14 +203,14 @@ void MainWindow::addDocument(Document* doc)
     });
     connect(&doc->undo, &QUndoStack::cleanChanged, this, [this, doc](bool) { updateTabTitle(doc); });
     connect(doc, &Document::activeLayerChanged, this, [this, doc] {
-        if (doc != currentDoc() || !m_dockProps) return;
+        if (doc != currentDoc()) return;
         auto l = doc->activeLayer();
         if (l && l->type == Layer::Adjustment)
-            m_dockProps->raise();
+            revealPanel(m_panelProps);
     });
     connect(doc, &Document::structureChanged, this, [this, doc] {
         if (doc == currentDoc())
-            m_statusSize->setText(QString("%1 x %2").arg(doc->width()).arg(doc->height()));
+            m_statusSize->setText(QString("%1 × %2").arg(doc->width()).arg(doc->height()));
     });
 
     int idx = m_tabs->addTab(canvas, doc->name);
@@ -237,12 +249,13 @@ void MainWindow::newDocument(const QSize& size, const QColor& bg)
     }
 }
 
-void MainWindow::openPath(const QString& path)
+void MainWindow::openPath(const QString& path, bool quiet)
 {
     if (path.endsWith(".pgd", Qt::CaseInsensitive)) {
         Document* doc = Document::loadProject(path);
         if (!doc) {
-            QMessageBox::warning(this, "Open", "Could not open project:\n" + path);
+            if (!quiet)
+                QMessageBox::warning(this, "Open", "Could not open project:\n" + path);
             return;
         }
         addDocument(doc);
@@ -254,7 +267,8 @@ void MainWindow::openPath(const QString& path)
     reader.setAutoTransform(true);
     QImage img = reader.read();
     if (img.isNull()) {
-        QMessageBox::warning(this, "Open", "Could not read image:\n" + path + "\n" + reader.errorString());
+        if (!quiet)
+            QMessageBox::warning(this, "Open", "Could not read image:\n" + path + "\n" + reader.errorString());
         return;
     }
     Document* doc = Document::fromImage(img, QFileInfo(path).completeBaseName());
@@ -297,7 +311,10 @@ void MainWindow::savePanelLayout()
 {
     QSettings s;
     s.setValue("layout/geometry", saveGeometry());
-    s.setValue("layout/state", saveState());
+    s.setValue("layout/workspace",
+               QJsonDocument(m_dock->saveLayout()).toJson(QJsonDocument::Compact));
+    // Left behind by the old QDockWidget layout; nothing reads it any more.
+    s.remove("layout/state");
 }
 
 // ============================ save / export ============================
@@ -523,7 +540,7 @@ void MainWindow::buildToolbar()
     tb->setObjectName("toolsBar");
     tb->setOrientation(Qt::Vertical);
     tb->setMovable(false);
-    tb->setIconSize(QSize(20, 20));
+    tb->setIconSize(QSize(18, 18));
     addToolBar(Qt::LeftToolBarArea, tb);
 
     auto* group = new QActionGroup(this);
@@ -533,20 +550,26 @@ void MainWindow::buildToolbar()
     auto addTool = [&](ToolType t, const QString& iconName, const QString& name,
                        const QString& shortcut, const QString& desc) {
         auto* a = new QAction(name, this);
-        a->setIcon(QIcon(QString(":/icons/%1.svg").arg(iconName)));
+        const QString svg = QString(":/icons/%1.svg").arg(iconName);
+        a->setIcon(QIcon(svg));
         a->setCheckable(true);
-        // Rich text so the tool name reads as a heading above its description.
-        QString tip = "<b>" + name.toHtmlEscaped() + "</b>";
+        // The name leads on tone and size, not weight; the description follows
+        // a step quieter.
+        QString tip = QString("<span style='color:%1;'>%2</span>")
+                          .arg(Theme::Text, name.toHtmlEscaped());
         if (!shortcut.isEmpty())
-            tip += " <span style='color:#8a8a92;'>" + shortcut.toHtmlEscaped() + "</span>";
+            tip += QString("  <span style='color:%1;'>%2</span>")
+                       .arg(Theme::Text3, shortcut.toHtmlEscaped());
         if (!desc.isEmpty())
-            tip += "<br><span style='color:#b6b6be;'>" + desc.toHtmlEscaped() + "</span>";
+            tip += QString("<br><span style='color:%1;'>%2</span>")
+                       .arg(Theme::Text2, desc.toHtmlEscaped());
         a->setToolTip(tip);
         a->setStatusTip(desc.isEmpty() ? name : desc);
         if (!shortcut.isEmpty()) a->setShortcut(QKeySequence(shortcut));
         connect(a, &QAction::triggered, this, [this, t] { setTool(t); });
         group->addAction(a);
         tb->addAction(a);
+        IconGlow::install(qobject_cast<QToolButton*>(tb->widgetForAction(a)), svg);
         m_toolActions[int(t)] = a;
         return a;
     };
@@ -590,7 +613,7 @@ void MainWindow::buildToolbar()
     addTool(ToolType::Hand, "hand", "Hand", "H",
             "Drag to pan the canvas — or just hold Space with any tool");
 
-    m_toolActions[int(ToolType::Move)]->setChecked(true);
+    m_toolActions[int(m_tool)]->setChecked(true);
 
     // M toggles marquee shape, U cycles shape tools
     auto* marqueeShortcut = new QAction(this);
@@ -670,6 +693,7 @@ void MainWindow::buildOptionsBar()
     bar->setObjectName("optionsBar");
     bar->setMovable(false);
     addToolBar(Qt::TopToolBarArea, bar);
+    m_optionsBar = bar;
 
     m_optStack = new QStackedWidget;
     m_optStack->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
@@ -684,10 +708,12 @@ void MainWindow::buildOptionsBar()
         return lay;
     };
 
-    // page 0: generic hint
+    // Page 0 — the tools that carry no settings. The strip never hides: a bar
+    // that comes and going as you switch tools makes the whole canvas jump.
+    // It holds its height and says something small instead.
     {
         auto* lay = mkPage();
-        lay->addWidget(new QLabel("Wheel = zoom · Space-drag / middle-drag = pan · Shift adds to selection, Alt subtracts"));
+        lay->addWidget(new QLabel("Drag to move · Space to pan · Wheel to zoom"));
         lay->addStretch();
     }
     // sliders that mirror a ToolSettings field and stay in sync across pages
@@ -822,20 +848,25 @@ void MainWindow::buildOptionsBar()
         lay->addStretch();
     }
 
-    // right corner: rulers / snapping toggles
-    auto* rulersBtn = new QAction(QIcon(":/icons/ruler.svg"), "Rulers && Guides", this);
+    // ---- view toggles, parked at the strip's right edge ----
+    auto* spacer = new QWidget;
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    bar->addWidget(spacer);
+
+    auto* rulersBtn = new QAction("Rulers", this);
     rulersBtn->setCheckable(true);
     rulersBtn->setChecked(m_ts.showRulers);
-    rulersBtn->setToolTip("Show rulers and guides — drag out of a ruler to create a guide,\n"
-                          "drag a guide back to the ruler to remove it (Move tool)");
+    rulersBtn->setToolTip("Rulers and guides — drag out of a ruler to place a guide,\n"
+                          "drag one back to remove it (Move tool)");
     connect(rulersBtn, &QAction::triggered, this, [this](bool on) {
         m_ts.showRulers = on;
         if (Canvas* c = currentCanvas()) c->update();
     });
+
     auto* snapBtn = new QAction("Snap", this);
     snapBtn->setCheckable(true);
     snapBtn->setChecked(m_ts.snapping);
-    snapBtn->setToolTip("Snap moves/selections/crops to guides and canvas edges/center");
+    snapBtn->setToolTip("Snap moves, selections and crops to guides and canvas edges");
     connect(snapBtn, &QAction::triggered, this, [this](bool on) { m_ts.snapping = on; });
 
     bar->addAction(rulersBtn);
@@ -846,33 +877,11 @@ void MainWindow::buildOptionsBar()
 
 void MainWindow::buildDocks()
 {
-    auto mkDock = [&](const QString& title, QWidget* w, Qt::DockWidgetArea area) {
-        auto* d = new QDockWidget(title);
-        d->setObjectName(title);
-        d->setWidget(w);
-        // No DockWidgetMovable: the tab strip runs the drag, and leaving Qt's
-        // mover on would start a competing rubber-band drag from the same press.
-        d->setFeatures(QDockWidget::DockWidgetClosable | QDockWidget::DockWidgetFloatable);
-        d->setAllowedAreas(Qt::AllDockWidgetAreas);
-        // The tab strip IS the panel's header — its tabs are the drag handles.
-        // Nothing sits above it, so there is only ever one header per panel.
-        d->setTitleBarWidget(new DockTitleBar(d));
-        addDockWidget(area, d);
-        // Record deliberate show/hide only. updateChromeForView() flips panels
-        // in bulk when swapping Home/editor; that must not look like intent.
-        connect(d->toggleViewAction(), &QAction::toggled, this, [this, d](bool on) {
-            if (m_switchingView) return;
-            if (on) m_userClosed.remove(d);
-            else    m_userClosed.insert(d);
-        });
-        return d;
-    };
-
-    m_color = new ColorPanel(&m_ts);
-    m_props = new PropertiesPanel;
-    m_layers = new LayersPanel;
+    m_color   = new ColorPanel(&m_ts);
+    m_props   = new PropertiesPanel;
+    m_layers  = new LayersPanel;
     m_brushes = new BrushesPanel(&m_ts);
-    m_adjust = new AdjustmentsPanel;
+    m_adjust  = new AdjustmentsPanel;
     m_history = new HistoryPanel(&m_undoGroup);
 
     connect(m_brushes, &BrushesPanel::presetChosen, this, [this] {
@@ -885,78 +894,143 @@ void MainWindow::buildDocks()
         auto l = Layer::makeAdjustment(t);
         if (t == FilterType::Grayscale) l->name = "Black & White";
         doc->undo.push(new AddLayerCommand(doc, l, doc->activeIndex + 1, "New Adjustment"));
-        if (m_dockProps) m_dockProps->raise();
+        revealPanel(m_panelProps);
     });
 
-    auto* dColor = mkDock("Color", m_color, Qt::RightDockWidgetArea);
-    auto* dBrushes = mkDock("Brushes", m_brushes, Qt::RightDockWidgetArea);
-    auto* dLayers = mkDock("Layers", m_layers, Qt::RightDockWidgetArea);
-    auto* dProps = mkDock("Properties", m_props, Qt::RightDockWidgetArea);
-    auto* dAdjust = mkDock("Adjustments", m_adjust, Qt::RightDockWidgetArea);
-    auto* dHistory = mkDock("History", m_history, Qt::RightDockWidgetArea);
-    m_dockProps = dProps;
-    m_dockLayers = dLayers;
+    // The canvas goes in first and is pinned: it can never be closed, torn off,
+    // or tabbed over, so there is always something to dock against.
+    DockPanel* canvas = m_dock->addPanel("Canvas", "Canvas", m_tabs);
+    canvas->setPinned(true);
 
-    // Default layout: every panel is its own stacked slot down the right edge.
-    // Nothing is pre-tabified — drag a header onto another panel to tab them,
-    // or out of the window to float it.
-    m_docks = QList<QDockWidget*>{dColor, dBrushes, dLayers, dProps, dAdjust, dHistory};
-    resizeDocks(m_docks, QList<int>{200, 170, 260, 200, 180, 160}, Qt::Vertical);
+    // Stock workspace: one column on the right, three groups of two tabs.
+    m_panelLayers = m_dock->addPanel("Layers", "Layers", m_layers, DockZone::Right);
+    m_dock->addPanel("History", "History", m_history, DockZone::Center, m_panelLayers);
 
-    // Remember whatever arrangement the user lands on.
-    m_defaultLayout = saveState();
-    QSettings s;
-    const QByteArray geo = s.value("layout/geometry").toByteArray();
-    const QByteArray st = s.value("layout/state").toByteArray();
-    if (!geo.isEmpty()) restoreGeometry(geo);
-    if (!st.isEmpty()) restoreState(st);
+    DockPanel* color = m_dock->addPanel("Color", "Color", m_color, DockZone::Top, m_panelLayers);
+    m_dock->addPanel("Adjustments", "Adjustments", m_adjust, DockZone::Center, color);
+    // Adjustments arrives second and would sit in front; Color is what you
+    // reach for first, so it keeps the tab.
+    if (DockGroup* g = color->group()) g->setCurrentIndex(g->indexOf(color));
 
-    // Qt grows its own QTabBar for each tabbed dock group. Our strip already
-    // shows those tabs, so the native one would be a second, duplicate header —
-    // collapse it. They are created on demand, hence the polish-time sweep.
-    hideNativeDockTabs();
-    for (QDockWidget* d : m_docks)
-        if (auto* strip = qobject_cast<DockTitleBar*>(d->titleBarWidget()))
-            strip->refresh();
+    m_panelProps = m_dock->addPanel("Properties", "Properties", m_props,
+                                    DockZone::Bottom, m_panelLayers);
+    m_dock->addPanel("Brushes", "Brushes", m_brushes, DockZone::Center, m_panelProps);
+
+    // Splitter sizes only mean something once the window has been laid out, and
+    // the saved workspace can only be restored after every panel exists — so
+    // both wait for the first trip through the event loop.
+    QTimer::singleShot(0, this, [this] {
+        applyDefaultProportions();
+        m_dock->captureDefaultLayout();
+
+        // Bumping kLayoutVersion retires everyone's saved workspace once, so a
+        // new stock arrangement is actually seen instead of being masked by
+        // the old one. After that first launch their own layout persists again.
+        constexpr int kLayoutVersion = 2;
+        QSettings s;
+        if (s.value("layout/version").toInt() != kLayoutVersion) {
+            s.remove("layout/workspace");
+            s.setValue("layout/version", kLayoutVersion);
+        }
+
+        const QByteArray saved = s.value("layout/workspace").toByteArray();
+        if (!saved.isEmpty()) {
+            const QJsonObject o = QJsonDocument::fromJson(saved).object();
+            if (!o.isEmpty()) m_dock->restoreLayout(o);
+        }
+    });
+}
+
+// The stock proportions. The canvas is the work; the tool column is a margin
+// beside it, no wider than its widest control needs.
+void MainWindow::applyDefaultProportions()
+{
+    DockArea* area = m_dock->mainArea();
+    auto* root = qobject_cast<QSplitter*>(area->root());
+    if (!root || root->orientation() != Qt::Horizontal || root->count() != 2) return;
+
+    const int w = area->width()  > 600 ? area->width()  : 1500;
+    const int h = area->height() > 400 ? area->height() : 900;
+    const int rail = 272;
+    root->setSizes({ w - rail, rail });
+    if (auto* col = qobject_cast<QSplitter*>(root->widget(1)))
+        if (col->count() == 3)
+            col->setSizes({ int(h * 0.30), int(h * 0.40), int(h * 0.30) });
+}
+
+// Opens a panel if it was closed and brings its tab to the front.
+void MainWindow::revealPanel(DockPanel* p)
+{
+    if (!p) return;
+    m_dock->openPanel(p);
+    if (DockGroup* g = p->group()) {
+        g->setCurrentIndex(g->indexOf(p));
+        if (QWidget* w = g->window()) w->raise();
+    }
 }
 
 void MainWindow::tabifyPanelsForTest(const QString& a, const QString& b)
 {
-    QDockWidget *da = nullptr, *db = nullptr;
-    for (QDockWidget* d : m_docks) {
-        if (d->objectName() == a) da = d;
-        if (d->objectName() == b) db = d;
-    }
-    if (!da || !db) return;
-    tabifyDockWidget(da, db);
-    da->show();
-    da->raise();
-    hideNativeDockTabs();
-    for (QDockWidget* d : m_docks)
-        if (auto* s = qobject_cast<DockTitleBar*>(d->titleBarWidget())) s->refresh();
-}
-
-void MainWindow::hideNativeDockTabs()
-{
-    for (QTabBar* tb : findChildren<QTabBar*>(QString(), Qt::FindDirectChildrenOnly)) {
-        tb->setFixedHeight(0);
-        tb->hide();
-    }
+    DockPanel* pa = m_dock->panel(a);
+    DockPanel* pb = m_dock->panel(b);
+    if (!pa || !pb || !pa->group()) return;
+    m_dock->dockInto(pb, pa->group(), DockZone::Center);
 }
 
 void MainWindow::resetPanelLayout()
 {
-    // Undo any floating/tabbing and put every panel back in its own slot.
-    // Reset means "all panels back", so previous closes are forgotten too —
-    // otherwise updateChromeForView() would re-hide them on the next switch.
-    m_switchingView = true;
-    m_userClosed.clear();
-    for (QDockWidget* d : m_docks) {
-        d->setFloating(false);
-        d->show();
+    m_dock->resetLayout();
+    m_zen = false;
+    applyDefaultProportions();
+}
+
+// Rebuilt every time the menu drops down, so the ticks always match the
+// workspace even after panels have been dragged, tabbed or torn off.
+void MainWindow::refreshWindowMenu()
+{
+    if (!m_windowMenu) return;
+    m_windowMenu->clear();
+
+    for (DockPanel* p : m_dock->panels()) {
+        if (p->isPinned()) continue;
+        QAction* a = m_windowMenu->addAction(p->title());
+        a->setCheckable(true);
+        a->setChecked(m_dock->isOpen(p));
+        connect(a, &QAction::triggered, this, [this, p] {
+            if (m_dock->isOpen(p)) m_dock->closePanel(p);
+            else                   revealPanel(p);
+        });
     }
-    restoreState(m_defaultLayout);
-    m_switchingView = false;
+
+    m_windowMenu->addSeparator();
+    QAction* zen = m_windowMenu->addAction("Focus Mode", QKeySequence("Tab"),
+                                           this, [this] { toggleFocusMode(); });
+    zen->setCheckable(true);
+    zen->setChecked(m_zen);
+    zen->setToolTip("Clear every panel out of the way, then bring the same workspace back");
+
+    m_windowMenu->addAction("Reset Workspace", this, [this] {
+        resetPanelLayout();
+        statusBar()->showMessage("Workspace reset", 2000);
+    });
+}
+
+// Everything away, then everything back exactly as it was — the workspace is
+// saved rather than remembered panel by panel, so splits and tabs survive.
+void MainWindow::toggleFocusMode()
+{
+    if (m_zen) {
+        if (!m_zenLayout.isEmpty()) m_dock->restoreLayout(m_zenLayout);
+        m_zen = false;
+        statusBar()->showMessage("Workspace restored", 2000);
+        return;
+    }
+    m_zenLayout = m_dock->saveLayout();
+    const QList<DockPanel*> ps = m_dock->panels();
+    for (DockPanel* p : ps)
+        if (!p->isPinned()) m_dock->closePanel(p);
+    m_zen = true;
+    statusBar()->showMessage("Focus mode — press Tab to bring the panels back", 3000);
 }
 
 // ============================ menus ============================
@@ -970,7 +1044,7 @@ void MainWindow::buildMenus()
     leftLay->setSpacing(2);
 
     auto* homeBtn = new QToolButton;
-    homeBtn->setIcon(QIcon(":/icons/home.svg"));
+    IconGlow::install(homeBtn, ":/icons/home.svg", 17);
     homeBtn->setToolButtonStyle(Qt::ToolButtonIconOnly);
     homeBtn->setAutoRaise(true);
     homeBtn->setCursor(Qt::PointingHandCursor);
@@ -978,7 +1052,7 @@ void MainWindow::buildMenus()
     connect(homeBtn, &QToolButton::clicked, this, [this] { showHome(); });
 
     auto* newBtn = new QToolButton;
-    newBtn->setIcon(QIcon(":/icons/new-file.svg"));
+    IconGlow::install(newBtn, ":/icons/new-file.svg", 17);
     newBtn->setToolButtonStyle(Qt::ToolButtonIconOnly);
     newBtn->setAutoRaise(true);
     newBtn->setCursor(Qt::PointingHandCursor);
@@ -1202,25 +1276,9 @@ void MainWindow::buildMenus()
     fs->setCheckable(true);
 
     // ---- Window ----
-    QMenu* window = menuBar()->addMenu("&Window");
-    for (QDockWidget* d : findChildren<QDockWidget*>())
-        window->addAction(d->toggleViewAction());
-    window->addSeparator();
-    window->addAction("Show All Panels", this, [this] {
-        for (QDockWidget* d : findChildren<QDockWidget*>()) d->show();
-    });
-    window->addAction("Hide All Panels (Tab)", QKeySequence("Tab"), this, [this] {
-        bool anyVisible = false;
-        for (QDockWidget* d : findChildren<QDockWidget*>())
-            if (d->isVisible()) { anyVisible = true; break; }
-        for (QDockWidget* d : findChildren<QDockWidget*>())
-            d->setVisible(!anyVisible);
-    });
-    window->addSeparator();
-    window->addAction("Reset Panel Layout", this, [this] {
-        resetPanelLayout();
-        statusBar()->showMessage("Panel layout reset", 2000);
-    });
+    m_windowMenu = menuBar()->addMenu("&Window");
+    connect(m_windowMenu, &QMenu::aboutToShow, this, [this] { refreshWindowMenu(); });
+    refreshWindowMenu();   // now, so the Tab shortcut exists before it is opened
 
     // ---- Help ----
     QMenu* help = menuBar()->addMenu("&Help");
@@ -1233,7 +1291,7 @@ void MainWindow::buildMenus()
     help->addSeparator();
     help->addAction("About", this, [this] {
         QMessageBox::about(this, "About PhotoGod",
-            "<b>PhotoGod</b> — a fast layer-based image editor.<br><br>"
+            "PhotoGod — a fast layer-based image editor.<br><br>"
             "Qt 6 · C++20 · layers, masks, brushes, selections, adjustments.<br>"
             "Save projects as .pgd, export PNG/JPG/WebP.");
     });
@@ -1277,10 +1335,7 @@ void MainWindow::revealLayer(int index)
     Document* doc = currentDoc();
     if (!doc || index < 0 || index >= doc->layers.size()) return;
     doc->setActiveIndex(index);
-    if (m_dockLayers) {
-        m_dockLayers->show();
-        m_dockLayers->raise();
-    }
+    revealPanel(m_panelLayers);
     m_layers->highlightLayer(index);
     statusBar()->showMessage("Selected layer: " + doc->layers[index]->name, 3000);
 }
@@ -1367,7 +1422,7 @@ QList<PaletteCommand> MainWindow::collectCommands()
             auto l = Layer::makeAdjustment(t);
             if (t == FilterType::Grayscale) l->name = "Black & White";
             d->undo.push(new AddLayerCommand(d, l, d->activeIndex + 1, "New Adjustment"));
-            if (m_dockProps) { m_dockProps->show(); m_dockProps->raise(); }
+            revealPanel(m_panelProps);
         };
         out.append(c);
     }
@@ -1423,16 +1478,18 @@ QList<PaletteCommand> MainWindow::collectCommands()
     }
 
     // ---- panels ----
-    for (QDockWidget* d : findChildren<QDockWidget*>()) {
+    for (DockPanel* p : m_dock->panels()) {
+        if (p->isPinned()) continue;
+        const bool open = m_dock->isOpen(p);
         PaletteCommand c;
         c.category = "Panel";
-        c.title = (d->isVisible() ? "Hide " : "Show ") + d->objectName() + " Panel";
-        c.keywords = "panel dock toggle window " + d->objectName();
-        QPointer<QDockWidget> ptr(d);
-        c.run = [ptr] {
+        c.title = (open ? "Hide " : "Show ") + p->title() + " Panel";
+        c.keywords = "panel dock toggle window workspace " + p->title();
+        QPointer<DockPanel> ptr(p);
+        c.run = [this, ptr] {
             if (!ptr) return;
-            ptr->setVisible(!ptr->isVisible());
-            if (ptr->isVisible()) ptr->raise();
+            if (m_dock->isOpen(ptr)) m_dock->closePanel(ptr);
+            else                     revealPanel(ptr);
         };
         out.append(c);
     }

@@ -5,8 +5,7 @@
 #include <QUndoGroup>
 #include <QHash>
 #include <QList>
-#include <QSet>
-#include <QByteArray>
+#include <QJsonObject>
 #include <functional>
 
 class Canvas;
@@ -23,8 +22,11 @@ class QTabWidget;
 class QStackedWidget;
 class QLabel;
 class QSlider;
+class QToolBar;
 class QActionGroup;
-class QDockWidget;
+class QMenu;
+class DockManager;
+class DockPanel;
 
 class MainWindow : public QMainWindow
 {
@@ -37,16 +39,20 @@ public:
     Document* currentDoc() const;
 
     void newDocument(const QSize& size = QSize(), const QColor& bg = Qt::white);
-    void openPath(const QString& path);
+    // quiet: fail silently instead of putting a dialog in the way — used at
+    // startup, where a stale path should just leave you on the home screen.
+    void openPath(const QString& path, bool quiet = false);
 
     void showHome();       // switch central view to the start screen
     void showEditor();     // switch central view to the document tabs
 
     void showCommandPalette(const QString& query = QString());
 
-    // Tabify two panels by title. Used by --tabshot to verify a tabbed group
+    // Group two panels by id. Used by --tabshot to verify a tabbed group
     // renders a single header.
     void tabifyPanelsForTest(const QString& a, const QString& b);
+
+    DockManager* dockManager() const { return m_dock; }   // --docktest drives this
 
     // Look up a palette command by exact title and run it. Returns false if no
     // such command exists. Used by --modeltest to drive the palette headlessly.
@@ -62,9 +68,12 @@ private:
     void buildOptionsBar();
     void buildMenus();
     void buildDocks();
-    void resetPanelLayout();       // restore the stock panel arrangement
-    void hideNativeDockTabs();     // collapse Qt's tab bar; our strip replaces it
-    void savePanelLayout();        // persist dock positions between sessions
+    void resetPanelLayout();          // restore the stock panel arrangement
+    void applyDefaultProportions();   // first-run splitter sizes, once laid out
+    void savePanelLayout();           // persist the workspace between sessions
+    void revealPanel(DockPanel* p);   // open it and bring its tab forward
+    void refreshWindowMenu();         // panel ticks, rebuilt on drop-down
+    void toggleFocusMode();           // stash the workspace away and back
     void buildCommandPalette();
 
     // Universal search: rebuilt on every open so layers stay current.
@@ -87,11 +96,11 @@ private:
     void placeImageAsLayer(const QImage& img, const QString& name);
 
     ToolSettings m_ts;
-    ToolType m_tool = ToolType::Move;
+    ToolType m_tool = ToolType::Brush;   // see ToolSettings — you start painting
 
-    QStackedWidget* m_central = nullptr;   // [0] = home, [1] = tabs
+    QStackedWidget* m_central = nullptr;   // [0] = home, [1] = the dock workspace
     HomePage* m_home = nullptr;
-    void updateChromeForView();            // enable/disable docks+toolbars for home vs editor
+    void updateChromeForView();            // swap panels+toolbars for home vs editor
     QTabWidget* m_tabs;
     QUndoGroup m_undoGroup;
     LayersPanel* m_layers;
@@ -100,19 +109,21 @@ private:
     BrushesPanel* m_brushes;
     AdjustmentsPanel* m_adjust;
     HistoryPanel* m_history = nullptr;
-    QDockWidget* m_dockProps = nullptr;
-    QDockWidget* m_dockLayers = nullptr;
-    QList<QDockWidget*> m_docks;    // every panel, in default stacking order
-    QByteArray m_defaultLayout;     // saveState() of the stock arrangement
-    QSet<QDockWidget*> m_userClosed;     // panels the user closed on purpose
-    bool m_switchingView = false;        // suppresses m_userClosed bookkeeping
+    DockManager* m_dock = nullptr;       // the whole panel workspace
+    DockPanel* m_panelProps = nullptr;
+    DockPanel* m_panelLayers = nullptr;
+    QMenu* m_windowMenu = nullptr;       // rebuilt whenever the workspace changes
+    QJsonObject m_zenLayout;             // the workspace focus mode put aside
+    bool m_zen = false;
     bool m_shuttingDown = false;         // set in ~MainWindow; see updateTabTitle
     CommandPalette* m_palette = nullptr;
 
     QStackedWidget* m_optStack;
+    QToolBar* m_optionsBar = nullptr;     // always on; its contents swap per tool
     QHash<int, QAction*> m_toolActions;   // key: int(ToolType)
     QSlider* m_brushSizeSlider = nullptr;
     QList<std::function<void()>> m_optionSync;   // refresh option widgets from m_ts
 
+    void buildStatusBar();
     QLabel *m_statusPos, *m_statusZoom, *m_statusSize;
 };

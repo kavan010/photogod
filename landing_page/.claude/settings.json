@@ -13,7 +13,14 @@
       "Bash(node shot.js)",
       "Bash(npx eslint *)",
       "Bash(pkill -f \"next dev\")",
-      "Bash(pkill -f \"next-server\")"
+      "Bash(pkill -f \"next-server\")",
+      "Bash(git checkout *)",
+      "Bash(npx tsc *)",
+      "Bash(echo \"tsc exit: $?\")",
+      "Bash(python3 -)"
+    ],
+    "additionalDirectories": [
+      "/home/kavang/Desktop/photogod/src"
     ]
   }
 }

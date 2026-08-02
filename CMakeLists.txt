@@ -25,7 +25,7 @@ add_executable(photogod
   src/Dialogs.cpp
   src/HomePage.cpp
   src/CommandPalette.cpp
-  src/DockTitleBar.cpp
+  src/Dock.cpp
   src/HistoryPanel.cpp
 )
 

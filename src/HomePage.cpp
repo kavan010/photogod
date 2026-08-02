@@ -1,4 +1,7 @@
 #include "HomePage.h"
+#include "Theme.h"
+#include <QAbstractButton>
+#include <QVariantAnimation>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QDir>
@@ -157,28 +160,116 @@ static QString relativeTime(const QDateTime& dt)
     if (!dt.isValid()) return QString();
     qint64 secs = dt.secsTo(QDateTime::currentDateTime());
     if (secs < 60)      return "just now";
-    if (secs < 3600)    return QString("%1 min ago").arg(secs / 60);
-    if (secs < 86400)   return QString("%1 h ago").arg(secs / 3600);
+    if (secs < 3600)    return QString("%1m ago").arg(secs / 60);
+    if (secs < 86400)   return QString("%1h ago").arg(secs / 3600);
     if (secs < 172800)  return "yesterday";
-    if (secs < 2592000) return QString("%1 days ago").arg(secs / 86400);
-    return dt.toString("MMM d, yyyy");
+    if (secs < 2592000) return QString("%1d ago").arg(secs / 86400);
+    return dt.toString("MMM d");
 }
 
-// Stable pleasant hue per project, so thumbnail-less cards still look intentional.
+// Stable hue per project, kept at low chroma so a wall of placeholder cards
+// stays calm instead of turning into a colour chart.
 static QColor accentFor(const QString& key)
 {
     uint h = qHash(key);
-    return QColor::fromHsv(int(h % 360), 150, 190);
+    return QColor::fromHsv(int(h % 360), 58, 92);
 }
 
 namespace {
 
-constexpr int kCardW  = 236;
-constexpr int kThumbW = 236;
-constexpr int kThumbH = 150;
-constexpr int kGap    = 18;
+constexpr int kCardW  = 264;
+constexpr int kThumbW = 264;
+constexpr int kThumbH = 166;
+constexpr int kGapX   = 24;
+constexpr int kGapY   = 30;
+// Narrow enough to hug two cards, wide enough that the action row never
+// squeezes when there is nothing to show yet.
+constexpr int kMinColumnW = 470;
 
-// A single clickable project card: rounded thumbnail + editable name + timestamp.
+// ---- a quiet action row: label on the left, its key on the right ----
+class ActionTile : public QAbstractButton
+{
+    Q_OBJECT
+public:
+    ActionTile(const QString& label, const QString& key, QWidget* parent = nullptr)
+        : QAbstractButton(parent), m_key(key)
+    {
+        setText(label);
+        setCursor(Qt::PointingHandCursor);
+        setAttribute(Qt::WA_Hover, true);
+        setFocusPolicy(Qt::NoFocus);
+        setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        setFixedHeight(46);
+
+        // Same rule as the tool rail: the pointer brightens the label, it does
+        // not switch a panel on behind it.
+        m_glow.setDuration(120);
+        m_glow.setStartValue(0.0);
+        m_glow.setEndValue(1.0);
+        connect(&m_glow, &QVariantAnimation::valueChanged, this,
+                [this](const QVariant& v) { m_t = v.toReal(); update(); });
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+
+        QFont kf = Theme::uiFont(11);
+        QFontMetrics kfm(kf);
+        int kw = kfm.horizontalAdvance(m_key) + 16;
+        QRectF chip(width() - kw - 16, height() / 2.0 - 9, kw, 18);
+        QPainterPath cp;
+        cp.addRoundedRect(chip, 5, 5);
+        p.fillPath(cp, Theme::color(Theme::Raised));
+        p.setFont(kf);
+        p.setPen(mix(Theme::Text3, Theme::Text2));
+        p.drawText(chip, Qt::AlignCenter, m_key);
+
+        p.setFont(Theme::uiFont(14));
+        p.setPen(mix(Theme::Text2, Theme::Text));
+        p.drawText(QRect(16, 0, int(chip.left()) - 26, height()),
+                   Qt::AlignVCenter | Qt::AlignLeft, text());
+    }
+    void enterEvent(QEnterEvent*) override { glow(true); }
+    void leaveEvent(QEvent*) override       { glow(false); }
+
+    // Width follows the words, so the key chip sits right beside its label
+    // instead of across a canyon of empty button.
+    QSize sizeHint() const override
+    {
+        QFontMetrics lf(Theme::uiFont(14)), kf(Theme::uiFont(11));
+        return QSize(16 + lf.horizontalAdvance(text()) + 22
+                        + kf.horizontalAdvance(m_key) + 16 + 16, 46);
+    }
+
+private:
+    // idle → hover, along the current animation position
+    QColor mix(const char* idle, const char* hot) const
+    {
+        const QColor a = Theme::color(idle), b = Theme::color(hot);
+        return QColor(a.red()   + int((b.red()   - a.red())   * m_t),
+                      a.green() + int((b.green() - a.green()) * m_t),
+                      a.blue()  + int((b.blue()  - a.blue())  * m_t));
+    }
+
+    void glow(bool in)
+    {
+        m_glow.stop();
+        m_glow.setDirection(in ? QAbstractAnimation::Forward
+                               : QAbstractAnimation::Backward);
+        m_glow.setCurrentTime(int(m_t * m_glow.duration()));
+        m_glow.start();
+    }
+
+    QVariantAnimation m_glow;
+    qreal m_t = 0.0;
+    QString m_key;
+};
+
+// A project is its own thumbnail. No frame, no fill, no border — the picture
+// sits on the page and the name lives quietly underneath it.
 class ProjectCard : public QFrame
 {
     Q_OBJECT
@@ -190,33 +281,33 @@ public:
         setCursor(Qt::PointingHandCursor);
         setFixedWidth(kCardW);
         setAttribute(Qt::WA_Hover, true);
+        setFocusPolicy(Qt::StrongFocus);   // the grid is arrow-key navigable
+
+        m_source = QImage(Recents::thumbnailPath(QFileInfo(m_entry.path).absoluteFilePath()));
 
         auto* lay = new QVBoxLayout(this);
-        lay->setContentsMargins(0, 0, 0, 0);   // no padding — thumbnail is flush
+        lay->setContentsMargins(0, 0, 0, 0);
         lay->setSpacing(0);
 
         m_thumb = new QLabel;
         m_thumb->setFixedSize(kThumbW, kThumbH);
         m_thumb->setObjectName("cardThumb");
         m_thumb->setAlignment(Qt::AlignCenter);
-        m_thumb->setPixmap(buildThumb());
+        m_thumb->setAttribute(Qt::WA_TransparentForMouseEvents, true);
         lay->addWidget(m_thumb);
-
-        auto* meta = new QWidget;
-        meta->setObjectName("cardMeta");
-        auto* ml = new QVBoxLayout(meta);
-        ml->setContentsMargins(12, 10, 12, 11);
-        ml->setSpacing(3);
+        lay->addSpacing(12);
 
         // title area: label and inline editor share one slot
         auto* titleHost = new QWidget;
+        titleHost->setFixedHeight(19);
         m_titleStack = new QStackedLayout(titleHost);
         m_titleStack->setContentsMargins(0, 0, 0, 0);
 
         m_title = new QLabel;
         m_title->setObjectName("cardTitle");
-        m_title->setToolTip(m_entry.path + "\n\nDouble-click the title to rename");
+        m_title->setToolTip(m_entry.path);
         m_title->setWordWrap(false);
+        m_title->setAttribute(Qt::WA_TransparentForMouseEvents, true);
         m_titleStack->addWidget(m_title);
 
         m_editor = new QLineEdit;
@@ -225,14 +316,16 @@ public:
         connect(m_editor, &QLineEdit::editingFinished, this, &ProjectCard::commitRename);
         m_titleStack->addWidget(m_editor);
 
-        ml->addWidget(titleHost);
+        lay->addWidget(titleHost);
+        lay->addSpacing(3);
 
         m_sub = new QLabel(relativeTime(m_entry.opened));
         m_sub->setObjectName("cardSub");
-        ml->addWidget(m_sub);
+        m_sub->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        lay->addWidget(m_sub);
 
-        lay->addWidget(meta);
         applyTitle();
+        repaintThumb();
     }
 
     QString path() const { return m_entry.path; }
@@ -255,6 +348,7 @@ protected:
     {
         // ignore clicks while the inline editor is up
         if (m_titleStack->currentWidget() == m_editor) { e->ignore(); return; }
+        setFocus(Qt::MouseFocusReason);
         m_armed = true;
     }
     void mouseReleaseEvent(QMouseEvent* e) override
@@ -265,13 +359,31 @@ protected:
     void mouseDoubleClickEvent(QMouseEvent* e) override
     {
         // double-click on the title text renames; anywhere else opens
-        if (m_title->geometry().translated(m_title->parentWidget()->mapTo(this, QPoint(0, 0)))
-                .adjusted(-4, -4, 4, 4).contains(e->pos())) {
+        if (m_title->geometry().adjusted(-4, -4, 4, 4).contains(e->pos())) {
             m_armed = false;
             beginRename();
             return;
         }
         emit activated(m_entry.path);
+    }
+    void enterEvent(QEnterEvent*) override { m_hover = true;  repaintThumb(); applyTitle(); }
+    void leaveEvent(QEvent*) override      { m_hover = false; repaintThumb(); applyTitle(); }
+    void focusInEvent(QFocusEvent*) override  { repaintThumb(); applyTitle(); }
+    void focusOutEvent(QFocusEvent*) override { repaintThumb(); applyTitle(); }
+
+    // Open / rename / forget without ever reaching for the mouse.
+    void keyPressEvent(QKeyEvent* e) override
+    {
+        switch (e->key()) {
+        case Qt::Key_Return: case Qt::Key_Enter: case Qt::Key_Space:
+            emit activated(m_entry.path); return;
+        case Qt::Key_F2:
+            beginRename(); return;
+        case Qt::Key_Delete: case Qt::Key_Backspace:
+            emit removeRequested(m_entry.path); return;
+        default:
+            QFrame::keyPressEvent(e);
+        }
     }
     void contextMenuEvent(QContextMenuEvent* e) override
     {
@@ -290,6 +402,7 @@ protected:
                 m_cancelled = true;
                 m_titleStack->setCurrentWidget(m_title);
                 m_cancelled = false;
+                setFocus(Qt::OtherFocusReason);
                 return true;
             }
         }
@@ -312,63 +425,77 @@ private:
     void applyTitle()
     {
         QFontMetrics fm(m_title->font());
-        m_title->setText(fm.elidedText(m_entry.name, Qt::ElideMiddle, kThumbW - 30));
+        m_title->setText(fm.elidedText(m_entry.name, Qt::ElideMiddle, kThumbW - 8));
+        m_title->setStyleSheet(QString("color: %1; background: transparent;")
+                                   .arg(active() ? Theme::Text : Theme::Text2));
     }
+
+    bool active() const { return m_hover || hasFocus(); }
+
+    void repaintThumb() { m_thumb->setPixmap(buildThumb()); }
 
     QPixmap buildThumb() const
     {
-        const int W = kThumbW, H = kThumbH, R = 10;
+        const int W = kThumbW, H = kThumbH;
+        const qreal R = 8;
         qreal dpr = devicePixelRatioF();
         QPixmap pm(QSize(W, H) * dpr);
         pm.setDevicePixelRatio(dpr);
         pm.fill(Qt::transparent);
 
-        QImage img(Recents::thumbnailPath(QFileInfo(m_entry.path).absoluteFilePath()));
-
         QPainter p(&pm);
         p.setRenderHint(QPainter::Antialiasing);
         p.setRenderHint(QPainter::SmoothPixmapTransform);
-        // only the top corners are rounded — the meta strip closes the card below
+
+        p.save();
         QPainterPath clip;
-        clip.setFillRule(Qt::WindingFill);
         clip.addRoundedRect(QRectF(0, 0, W, H), R, R);
-        clip.addRect(QRectF(0, H - R, W, R));
         p.setClipPath(clip);
 
-        if (!img.isNull()) {
-            p.fillRect(QRect(0, 0, W, H), QColor(24, 24, 27));
-            QImage scaled = img.scaled(QSize(W, H) * dpr, Qt::KeepAspectRatio,
-                                       Qt::SmoothTransformation);
+        if (!m_source.isNull()) {
+            p.fillRect(QRect(0, 0, W, H), Theme::color(Theme::Void));
+            QImage scaled = m_source.scaled(QSize(W, H) * dpr, Qt::KeepAspectRatio,
+                                            Qt::SmoothTransformation);
             scaled.setDevicePixelRatio(dpr);
             QSizeF ss = scaled.size() / dpr;
             p.drawImage(QPointF((W - ss.width()) / 2.0, (H - ss.height()) / 2.0), scaled);
         } else {
-            // no cached preview — a tinted gradient plus the project's initial
+            // no cached preview — a barely-there tint plus the project's initial
             QColor a = accentFor(m_entry.path);
             QLinearGradient g(0, 0, W, H);
-            g.setColorAt(0.0, a.darker(190));
-            g.setColorAt(1.0, a.darker(280));
+            g.setColorAt(0.0, a.darker(230));
+            g.setColorAt(1.0, a.darker(330));
             p.fillRect(QRect(0, 0, W, H), g);
 
             QString initial = m_entry.name.trimmed().left(1).toUpper();
             if (initial.isEmpty()) initial = "?";
-            QFont f = p.font();
-            f.setPointSize(30);
-            f.setWeight(QFont::DemiBold);
-            p.setFont(f);
-            p.setPen(QColor(255, 255, 255, 70));
+            p.setFont(Theme::uiFont(40));
+            p.setPen(QColor(255, 255, 255, 46));
             p.drawText(QRect(0, 0, W, H), Qt::AlignCenter, initial);
+        }
+        p.restore();
+
+        // Hover and keyboard focus are the only decoration a card ever gets.
+        if (active()) {
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(Theme::color(hasFocus() ? Theme::Accent : Theme::Text3,
+                                       hasFocus() ? 255 : 150),
+                          hasFocus() ? 2.0 : 1.0));
+            qreal in = hasFocus() ? 1.0 : 0.5;
+            p.drawRoundedRect(QRectF(in, in, W - 2 * in, H - 2 * in), R, R);
         }
         return pm;
     }
 
     RecentEntry m_entry;
+    QImage m_source;
     QLabel* m_thumb = nullptr;
     QLabel* m_title = nullptr;
     QLabel* m_sub = nullptr;
     QLineEdit* m_editor = nullptr;
     QStackedLayout* m_titleStack = nullptr;
     bool m_armed = false;
+    bool m_hover = false;
     bool m_cancelled = false;
 };
 
@@ -406,93 +533,57 @@ HomePage::HomePage(QWidget* parent) : QWidget(parent)
     canvasLay->addStretch(1);
 
     auto* col = new QVBoxLayout(m_column);
-    col->setContentsMargins(0, 0, 0, 48);
+    col->setContentsMargins(0, 0, 0, 64);
     col->setSpacing(0);
 
-    // ---- hero ----
-    col->addSpacing(56);
+    // ---- the only branding on the page ----
+    col->addSpacing(84);
 
-    auto* eyebrow = new QLabel("PHOTOGOD");
-    eyebrow->setObjectName("homeEyebrow");
-    eyebrow->setAlignment(Qt::AlignHCenter);
-    col->addWidget(eyebrow);
-    col->addSpacing(10);
+    auto* wordmark = new QLabel("Make something awesome");
+    wordmark->setObjectName("homeWordmark");
+    wordmark->setAlignment(Qt::AlignHCenter);
+    col->addWidget(wordmark);
 
-    auto* hero = new QLabel("Create Something");
-    hero->setObjectName("homeHero");
-    hero->setAlignment(Qt::AlignHCenter);
-    col->addWidget(hero);
-    col->addSpacing(6);
+    col->addSpacing(12);
 
-    auto* tagline = new QLabel("Start a blank canvas, or pick up where you left off.");
-    tagline->setObjectName("homeTagline");
-    tagline->setAlignment(Qt::AlignHCenter);
-    col->addWidget(tagline);
-
-    col->addSpacing(26);
-
-    // ---- primary actions, centred ----
+    // ---- two ways in, each with the key that gets you there faster ----
     auto* actions = new QHBoxLayout;
-    actions->setSpacing(10);
+    actions->setSpacing(8);
     actions->addStretch();
 
-    auto* newBtn = new QPushButton("＋   New Project");
-    newBtn->setObjectName("homeNewBtn");
-    newBtn->setCursor(Qt::PointingHandCursor);
-    newBtn->setFixedHeight(38);
-    connect(newBtn, &QPushButton::clicked, this, &HomePage::newRequested);
+    auto* newBtn = new ActionTile("New document", "N");
+    connect(newBtn, &QAbstractButton::clicked, this, &HomePage::newRequested);
     actions->addWidget(newBtn);
 
-    auto* openBtn = new QPushButton("Open Image");
-    openBtn->setObjectName("homeOpenBtn");
-    openBtn->setCursor(Qt::PointingHandCursor);
-    openBtn->setFixedHeight(38);
-    connect(openBtn, &QPushButton::clicked, this, &HomePage::openRequested);
+    auto* openBtn = new ActionTile("Open image", "O");
+    connect(openBtn, &QAbstractButton::clicked, this, &HomePage::openRequested);
     actions->addWidget(openBtn);
 
     actions->addStretch();
     col->addLayout(actions);
 
-    col->addSpacing(14);
+    col->addSpacing(56);
 
-    // ---- search, centred and narrower than the column ----
-    auto* searchRow = new QHBoxLayout;
-    searchRow->addStretch();
-    m_search = new QLineEdit;
-    m_search->setObjectName("homeSearch");
-    m_search->setPlaceholderText("Search projects…");
-    m_search->setClearButtonEnabled(true);
-    m_search->setFixedHeight(36);
-    m_search->setFixedWidth(340);
-    m_search->setAlignment(Qt::AlignHCenter);
-    connect(m_search, &QLineEdit::textChanged, this, [this](const QString& t) {
-        m_filter = t.trimmed();
-        rebuildGrid();
-    });
-    searchRow->addWidget(m_search);
-    searchRow->addStretch();
-    col->addLayout(searchRow);
-
-    col->addSpacing(44);
-
-    // ---- section header ----
+    // ---- section header: a label, and a filter that stays out of the way ----
     auto* sectionRow = new QHBoxLayout;
-    sectionRow->setContentsMargins(2, 0, 2, 0);
+    sectionRow->setContentsMargins(0, 0, 0, 0);
     m_sectionLabel = new QLabel("Recent");
     m_sectionLabel->setObjectName("homeSectionLabel");
     sectionRow->addWidget(m_sectionLabel);
     sectionRow->addStretch();
-    m_countLabel = new QLabel;
-    m_countLabel->setObjectName("homeCount");
-    sectionRow->addWidget(m_countLabel);
+
+    m_search = new QLineEdit;
+    m_search->setObjectName("homeSearch");
+    m_search->setPlaceholderText("Filter");
+    m_search->setClearButtonEnabled(true);
+    m_search->setFixedHeight(32);
+    m_search->setFixedWidth(220);
+    connect(m_search, &QLineEdit::textChanged, this, [this](const QString& t) {
+        m_filter = t.trimmed();
+        rebuildGrid();
+    });
+    sectionRow->addWidget(m_search);
     col->addLayout(sectionRow);
-
-    col->addSpacing(8);
-
-    auto* rule = new QFrame;
-    rule->setObjectName("homeRule");
-    rule->setFixedHeight(1);
-    col->addWidget(rule);
 
     col->addSpacing(20);
 
@@ -500,21 +591,17 @@ HomePage::HomePage(QWidget* parent) : QWidget(parent)
     m_gridHost = new QWidget;
     m_gridLay = new QGridLayout(m_gridHost);
     m_gridLay->setContentsMargins(0, 0, 0, 0);
-    m_gridLay->setHorizontalSpacing(kGap);
-    m_gridLay->setVerticalSpacing(kGap);
-    m_gridLay->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    m_gridLay->setHorizontalSpacing(kGapX);
+    m_gridLay->setVerticalSpacing(kGapY);
+    m_gridLay->setAlignment(Qt::AlignTop | Qt::AlignHCenter);
     col->addWidget(m_gridHost);
 
-    // ---- empty state ----
+    // ---- empty state: one line, no ornament ----
     m_empty = new QWidget;
     m_empty->setObjectName("homeEmpty");
     auto* el = new QVBoxLayout(m_empty);
-    el->setContentsMargins(0, 34, 0, 34);
-    el->setSpacing(8);
-    auto* glyph = new QLabel("✧");
-    glyph->setObjectName("homeEmptyGlyph");
-    glyph->setAlignment(Qt::AlignHCenter);
-    el->addWidget(glyph);
+    el->setContentsMargins(0, 6, 0, 34);
+    el->setSpacing(0);
     m_emptyText = new QLabel;
     m_emptyText->setObjectName("homeEmptyText");
     m_emptyText->setAlignment(Qt::AlignHCenter);
@@ -527,71 +614,90 @@ HomePage::HomePage(QWidget* parent) : QWidget(parent)
     m_scroll->setWidget(canvas);
     root->addWidget(m_scroll, 1);
 
-    setStyleSheet(R"(
-        #homePage, #homeScroll, #homeCanvas, #homeColumn { background: #191919; }
+    setStyleSheet(QString(R"(
+        #homePage, #homeScroll, #homeCanvas, #homeColumn { background: %VOID%; }
 
-        #homeEyebrow { color: #5c5c66; font-size: 10px; font-weight: 700;
-                       letter-spacing: 3px; }
-        #homeHero { color: #f2f2f4; font-size: 34px; font-weight: 700;
-                    letter-spacing: -0.6px; }
-        #homeTagline { color: #7d7d88; font-size: 13px; }
-
-        #homeNewBtn {
-            background: #4f7cff; color: #ffffff; border: none; border-radius: 8px;
-            padding: 0 20px; font-size: 13px; font-weight: 600;
-        }
-        #homeNewBtn:hover  { background: #6b91ff; }
-        #homeNewBtn:pressed { background: #4069e6; }
-
-        #homeOpenBtn {
-            background: #232326; color: #d4d4dc; border: 1px solid #303036;
-            border-radius: 8px; padding: 0 20px; font-size: 13px; font-weight: 500;
-        }
-        #homeOpenBtn:hover  { background: #2b2b30; border-color: #3f3f48; color: #ffffff; }
-        #homeOpenBtn:pressed { background: #202024; }
+        #homeWordmark { color: %TEXT%; font-size: 26px; letter-spacing: -0.2px; }
 
         #homeSearch {
-            background: #202024; color: #e6e6e8; border: 1px solid #2b2b32;
-            border-radius: 9px; padding: 0 14px; font-size: 13px;
+            background: transparent; color: %TEXT%; border: 1px solid %LINE%;
+            border-radius: 8px; padding: 0 12px; font-size: 13px;
         }
-        #homeSearch:focus { border-color: #4f7cff; background: #1c1c20; }
+        #homeSearch:hover { border-color: %ACTIVE%; }
+        #homeSearch:focus { border-color: %ACCENTDIM%; background: %PANEL%; }
 
-        #homeSectionLabel { color: #8a8a95; font-size: 11px; font-weight: 700;
-                            letter-spacing: 1.4px; }
-        #homeCount { color: #55555f; font-size: 11px; font-weight: 500; }
-        #homeRule  { background: #262629; border: none; }
+        #homeSectionLabel { color: %TEXT3%; font-size: 13px; }
 
         #homeEmpty { background: transparent; }
-        #homeEmptyGlyph { color: #3d3d45; font-size: 26px; }
-        #homeEmptyText  { color: #6b6b76; font-size: 13px; line-height: 155%; }
+        #homeEmptyText { color: %TEXT3%; font-size: 13px; }
 
-        #projectCard {
-            background: #202024; border: 1px solid #2a2a30; border-radius: 11px;
-        }
-        #projectCard:hover { background: #26262c; border-color: #4a4a58; }
+        #projectCard { background: transparent; border: none; }
         #cardThumb { background: transparent; border: none; }
-        #cardMeta  { background: transparent; border: none; }
-        #cardTitle { color: #e9e9ee; font-size: 13px; font-weight: 600;
-                     background: transparent; }
+        #cardTitle { color: %TEXT2%; font-size: 14px; background: transparent; }
         #cardTitleEdit {
-            background: #17171a; color: #ffffff; border: 1px solid #4f7cff;
-            border-radius: 4px; padding: 0 4px; font-size: 13px; font-weight: 600;
-            selection-background-color: #4f7cff;
+            background: %RAISED%; color: %TEXT%; border: 1px solid %ACCENTDIM%;
+            border-radius: 5px; padding: 0 5px; font-size: 14px;
+            selection-background-color: %ACCENTDIM%;
         }
-        #cardSub { color: #70707b; font-size: 11px; background: transparent; }
+        #cardSub { color: %TEXT3%; font-size: 12px; background: transparent; }
+    )")
+        .replace("%VOID%",      Theme::Void)
+        .replace("%PANEL%",     Theme::Panel)
+        .replace("%RAISED%",    Theme::Raised)
+        .replace("%ACTIVE%",    Theme::Active)
+        .replace("%LINE%",      Theme::Line)
+        .replace("%TEXT2%",     Theme::Text2)
+        .replace("%TEXT3%",     Theme::Text3)
+        .replace("%TEXT%",      Theme::Text)
+        .replace("%ACCENTDIM%", Theme::AccentDim));
+}
 
-        QScrollBar:vertical { background: transparent; width: 10px; margin: 4px; }
-        QScrollBar::handle:vertical { background: #33333a; border-radius: 5px; min-height: 36px; }
-        QScrollBar::handle:vertical:hover { background: #45454e; }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-    )");
+// Keyboard first: the grid is arrow-navigable, N and O are the two doors out,
+// and typing anything else lands in the filter.
+void HomePage::keyPressEvent(QKeyEvent* e)
+{
+    auto* card = qobject_cast<ProjectCard*>(focusWidget());
+    int idx = card ? m_cards.indexOf(card) : -1;
+
+    auto focusAt = [this](int i) {
+        if (m_cards.isEmpty()) return;
+        i = qBound(0, i, int(m_cards.size()) - 1);
+        m_cards[i]->setFocus(Qt::TabFocusReason);
+        if (m_scroll) m_scroll->ensureWidgetVisible(m_cards[i], 0, 40);
+    };
+
+    switch (e->key()) {
+    case Qt::Key_Right: focusAt(idx < 0 ? 0 : idx + 1); return;
+    case Qt::Key_Left:  focusAt(idx < 0 ? 0 : idx - 1); return;
+    case Qt::Key_Down:  focusAt(idx < 0 ? 0 : idx + m_cols); return;
+    case Qt::Key_Up:
+        if (idx >= m_cols) { focusAt(idx - m_cols); return; }
+        if (idx >= 0) { m_search->setFocus(Qt::TabFocusReason); return; }
+        return;
+    case Qt::Key_Escape:
+        if (!m_search->text().isEmpty()) m_search->clear();
+        setFocus(Qt::OtherFocusReason);
+        return;
+    case Qt::Key_N: emit newRequested();  return;
+    case Qt::Key_O: emit openRequested(); return;
+    default: break;
+    }
+
+    // any other printable character starts filtering
+    const QString t = e->text();
+    if (!t.isEmpty() && t.at(0).isPrint() && !(e->modifiers() & Qt::ControlModifier)) {
+        m_search->setFocus(Qt::OtherFocusReason);
+        m_search->setText(m_search->text() + t);
+        return;
+    }
+    QWidget::keyPressEvent(e);
 }
 
 void HomePage::showEvent(QShowEvent* e)
 {
     QWidget::showEvent(e);
     refresh();
+    setFocus(Qt::OtherFocusReason);   // keys work the moment the page appears
 }
 
 void HomePage::resizeEvent(QResizeEvent* e)
@@ -601,22 +707,29 @@ void HomePage::resizeEvent(QResizeEvent* e)
     rebuildGrid();
 }
 
-// The content column is 60% of the window, clamped so it never gets narrower
-// than a single card or so wide that the grid reads as a wall.
+// How many cards fit across in about two thirds of the window — the rest of
+// the width stays as margin, because the page should breathe, not fill.
+int HomePage::maxColumns() const
+{
+    int avail = m_scroll ? m_scroll->viewport()->width() : width();
+    int target = qBound(kCardW, int(avail * 0.66), 1200);
+    auto widthFor = [](int n) { return n * kCardW + (n - 1) * kGapX; };
+    int cols = std::max(1, (target + kGapX) / (kCardW + kGapX));
+    if (widthFor(cols + 1) <= avail - 48
+        && std::abs(widthFor(cols + 1) - target) < std::abs(widthFor(cols) - target))
+        ++cols;
+    return cols;
+}
+
+// The column is centred, so it has to hug what it holds: sized to the cards
+// actually on screen, never to the cards that could have been. Two projects
+// centre as a pair rather than hugging the left edge of an empty four-wide bed.
 void HomePage::applyColumnWidth()
 {
     if (!m_column) return;
-    int avail = m_scroll ? m_scroll->viewport()->width() : width();
-    int target = qBound(kCardW + 24, int(avail * 0.60), 1180);
-    // Snap up or down to a whole number of card columns — whichever lands
-    // closer to the 60% target — so the grid is never left visually lopsided.
-    int cols = std::max(1, (target + kGap) / (kCardW + kGap));
-    auto widthFor = [](int n) { return n * kCardW + (n - 1) * kGap; };
-    int w = widthFor(cols);
-    if (widthFor(cols + 1) <= avail - 32
-        && std::abs(widthFor(cols + 1) - target) < std::abs(w - target))
-        w = widthFor(cols + 1);
-    m_column->setFixedWidth(w);
+    int cols = m_cols > 0 ? m_cols : maxColumns();
+    int w = cols * kCardW + (cols - 1) * kGapX;
+    m_column->setFixedWidth(std::max(w, kMinColumnW));
 }
 
 void HomePage::refresh()
@@ -631,6 +744,7 @@ void HomePage::rebuildGrid()
     if (!m_gridLay) return;
 
     // clear existing cards
+    m_cards.clear();
     QLayoutItem* item;
     while ((item = m_gridLay->takeAt(0))) {
         if (item->widget()) item->widget()->deleteLater();
@@ -645,23 +759,28 @@ void HomePage::rebuildGrid()
             shown.append(e);
     }
 
-    m_countLabel->setText(shown.isEmpty()
-        ? QString()
-        : QString("%1 project%2").arg(shown.size()).arg(shown.size() == 1 ? "" : "s"));
+    // The filter is only worth showing once there is enough here to lose track of.
+    m_search->setVisible(m_entries.size() > 6 || !m_filter.isEmpty());
+    m_sectionLabel->setVisible(!m_entries.isEmpty());
 
     m_empty->setVisible(shown.isEmpty());
     m_gridHost->setVisible(!shown.isEmpty());
     if (shown.isEmpty()) {
+        m_cols = 0;
+        applyColumnWidth();
         m_emptyText->setText(m_filter.isEmpty()
-            ? "Nothing here yet.\nCreate a new project or open an image to get started."
-            : "No projects match \"" + m_filter + "\".");
+            ? "Nothing open yet — press N to start."
+            : "Nothing matches \"" + m_filter + "\".");
         return;
     }
 
-    int cols = std::max(1, (m_column->width() + kGap) / (kCardW + kGap));
+    m_cols = std::max(1, std::min(maxColumns(), int(shown.size())));
+    applyColumnWidth();
+    int cols = m_cols;
     int r = 0, c = 0;
     for (const RecentEntry& e : shown) {
         auto* card = new ProjectCard(e);
+        m_cards.append(card);
         connect(card, &ProjectCard::activated, this, &HomePage::projectRequested);
         connect(card, &ProjectCard::removeRequested, this, [this](const QString& p) {
             Recents::remove(p);

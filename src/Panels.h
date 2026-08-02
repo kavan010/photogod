@@ -61,7 +61,9 @@ class ColorPanel : public QWidget
     Q_OBJECT
 public:
     explicit ColorPanel(ToolSettings* ts, QWidget* parent = nullptr);
-    void setFg(const QColor& c);   // from eyedropper etc.
+    // commit=false is a live preview (eyedropper drag): the picker updates
+    // but the colour is not added to the recents strip until it settles.
+    void setFg(const QColor& c, bool commit = true);
     void swapColors();
 
 signals:
@@ -105,6 +107,11 @@ public:
     QToolButton* mergeButton() const { return m_btnMerge; }
     QToolButton* maskButton() const { return m_btnMask; }
     QToolButton* delMaskButton() const { return m_btnDelMask; }
+
+protected:
+    // Row widgets cover their item, so mouse events are relayed to the list
+    // viewport (otherwise selection and drag-reorder never see a press).
+    bool eventFilter(QObject* obj, QEvent* ev) override;
 
 private:
     void rebuild();

@@ -1,10 +1,16 @@
 #include "MainWindow.h"
+#include "Dock.h"
 #include "Canvas.h"
 #include "Commands.h"
 #include "HistoryPanel.h"
 #include <QPushButton>
 #include <QDialog>
 #include "CommandPalette.h"
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <functional>
+#include "Theme.h"
 #include <QApplication>
 #include <QStyleFactory>
 #include <QPalette>
@@ -30,6 +36,21 @@ public:
         default: break;
         }
         return QProxyStyle::styleHint(hint, opt, w, ret);
+    }
+};
+
+// Qt paints tooltips onto an opaque window, so a border-radius in the
+// stylesheet leaves four square corners showing the desktop behind them. The
+// tip label is created lazily and privately, so the only way in is to catch it
+// being polished and make its window translucent.
+class RoundTooltips : public QObject
+{
+protected:
+    bool eventFilter(QObject* o, QEvent* e) override
+    {
+        if (e->type() == QEvent::Polish && o->inherits("QTipLabel"))
+            static_cast<QWidget*>(o)->setAttribute(Qt::WA_TranslucentBackground, true);
+        return QObject::eventFilter(o, e);
     }
 };
 
@@ -350,13 +371,206 @@ static int runModelTest(MainWindow& w)
     return failures;
 }
 
+// Headless test of the workspace itself: every way a panel can be moved, and
+// the guarantee that the canvas survives all of them.
+static int runDockTest(MainWindow& w)
+{
+    int failures = 0;
+    auto check = [&](bool ok, const char* what) {
+        fprintf(stderr, "[%s] %s\n", ok ? "PASS" : "FAIL", what);
+        if (!ok) ++failures;
+    };
+
+    // Hit-testing reads real on-screen geometry, so the workspace has to be the
+    // visible view: with no document open the app sits on the home screen.
+    w.newDocument(QSize(400, 300), Qt::white);
+    QApplication::processEvents();
+
+    DockManager* dm = w.dockManager();
+    auto* canvas  = dm->panel("Canvas");
+    auto* layers  = dm->panel("Layers");
+    auto* brushes = dm->panel("Brushes");
+    auto* color   = dm->panel("Color");
+    check(dm && canvas && layers && brushes && color, "every stock panel exists");
+    if (!dm || !canvas || !layers || !brushes || !color) return 1;
+
+    // Counts the groups a panel's own area currently holds.
+    auto groupCount = [](DockPanel* p) {
+        DockGroup* g = p->group();
+        return (g && g->area()) ? g->area()->groups().size() : 0;
+    };
+
+    // ---- tab a panel into another group ----
+    DockGroup* layersGroup = layers->group();
+    const int before = layersGroup->count();
+    dm->dockInto(brushes, layersGroup, DockZone::Center);
+    check(brushes->group() == layersGroup && layersGroup->count() == before + 1,
+          "dropping a panel on a group's middle adds it as a tab");
+    check(layersGroup->currentPanel() == brushes, "the panel it just gained comes forward");
+
+    // ---- split a group ----
+    const int groupsBefore = groupCount(layers);
+    dm->dockInto(brushes, layersGroup, DockZone::Bottom);
+    check(brushes->group() != layersGroup, "splitting moves the panel to a group of its own");
+    check(groupCount(layers) == groupsBefore + 1, "the split produced exactly one new group");
+
+    // ---- tear off into a floating workspace, then dock it back ----
+    dm->floatPanel(brushes, QPoint(300, 300), QSize(320, 400));
+    check(brushes->group() && brushes->group()->area()
+              && brushes->group()->area()->floatingWindow(),
+          "a panel dropped outside becomes a floating workspace");
+    check(dm->isOpen(brushes), "a floating panel still counts as open");
+
+    // Group a second panel inside the floating workspace, proving a float is a
+    // full dock area and not a one-panel special case.
+    DockGroup* floatGroup = brushes->group();
+    dm->dockInto(color, floatGroup, DockZone::Right);
+    check(color->group() != floatGroup
+              && color->group()->area() == floatGroup->area(),
+          "a floating workspace can be split like any other");
+
+    dm->dockToAreaEdge(brushes, dm->mainArea(), DockZone::Left);
+    check(brushes->group() && brushes->group()->area() == dm->mainArea(),
+          "a floating panel can be docked back to a main-window edge");
+    dm->dockToAreaEdge(color, dm->mainArea(), DockZone::Right);
+
+    // ---- the canvas is immovable ----
+    dm->floatPanel(canvas, QPoint(10, 10));
+    check(canvas->group() && canvas->group()->area() == dm->mainArea(),
+          "the canvas refuses to be torn off");
+    dm->closePanel(canvas);
+    check(dm->isOpen(canvas), "the canvas refuses to be closed");
+
+    // ---- save / restore round trip ----
+    const QJsonObject saved = dm->saveLayout();
+    dm->dockInto(layers, brushes->group(), DockZone::Center);
+    dm->closePanel(color);
+    check(!dm->isOpen(color), "a closed panel leaves the tree");
+    check(dm->restoreLayout(saved), "the saved workspace restores");
+    check(dm->isOpen(color), "restoring brings a closed panel back where it was");
+    {
+        // Structure has to survive exactly. Pixel sizes are the splitters' own
+        // business — they are re-fitted to whatever room the window has.
+        std::function<QJsonObject(QJsonObject)> shape = [&](QJsonObject o) {
+            o.remove("sizes");
+            if (o.contains("children")) {
+                QJsonArray kids;
+                for (const QJsonValue& v : o["children"].toArray())
+                    kids.append(shape(v.toObject()));
+                o["children"] = kids;
+            }
+            return o;
+        };
+        const QByteArray a = QJsonDocument(shape(saved["main"].toObject())).toJson(QJsonDocument::Compact);
+        const QByteArray b = QJsonDocument(shape(dm->saveLayout()["main"].toObject())).toJson(QJsonDocument::Compact);
+        if (a != b) fprintf(stderr, "  saved: %s\n  again: %s\n", a.constData(), b.constData());
+        check(a == b, "a restored workspace rebuilds exactly the tree that was saved");
+    }
+
+    // ---- closing every panel leaves a usable window ----
+    for (DockPanel* p : dm->panels())
+        dm->closePanel(p);
+    check(dm->isOpen(canvas), "the canvas is still there once every panel is closed");
+    check(dm->mainArea()->groups().size() == 1,
+          "closing the last panel of a group collapses it out of the tree");
+    check(canvas->group() && canvas->group()->isBareCanvas(),
+          "the lone canvas group drops its tab strip");
+
+    dm->resetLayout();
+    check(dm->isOpen(layers) && dm->isOpen(brushes) && dm->isOpen(color),
+          "resetting the workspace brings every panel back");
+
+    // ---- the real thing: a mouse drag, through hit-testing and all ----
+    {
+        // The workspace was just rebuilt; hit-testing reads real geometry, so
+        // let the pending layout actually happen first.
+        QApplication::processEvents();
+
+        DockGroup* src = brushes->group();
+        DockGroup* dst = layers->group();
+        DockTabBar* bar = src->tabBar();
+        const QPoint from = bar->tabRect(src->indexOf(brushes)).center();
+        const QPoint toGlobal = QRect(dst->mapToGlobal(QPoint(0, 0)), dst->size()).center();
+
+        auto send = [&](QEvent::Type t, const QPoint& local) {
+            QMouseEvent ev(t, QPointF(local), QPointF(bar->mapToGlobal(local)),
+                           Qt::LeftButton,
+                           t == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton,
+                           Qt::NoModifier);
+            QApplication::sendEvent(bar, &ev);
+        };
+
+        send(QEvent::MouseButtonPress, from);
+        send(QEvent::MouseMove, from + QPoint(20, 0));       // clears the drag slop
+        check(dm->dragging(), "pressing a tab and pulling starts a drag");
+        send(QEvent::MouseMove, bar->mapFromGlobal(toGlobal));
+        send(QEvent::MouseButtonRelease, bar->mapFromGlobal(toGlobal));
+        check(!dm->dragging(), "letting go ends the drag");
+        check(brushes->group() == dst,
+              "dropping on the middle of a group tabs the panel into it");
+
+        // Same gesture, but let go over the group's left edge instead.
+        DockTabBar* bar2 = dst->tabBar();
+        const QPoint grab = bar2->tabRect(dst->indexOf(brushes)).center();
+        const QRect dstRect(dst->mapToGlobal(QPoint(0, 0)), dst->size());
+        const QPoint leftEdge(dstRect.left() + 6, dstRect.center().y());
+        auto send2 = [&](QEvent::Type t, const QPoint& local) {
+            QMouseEvent ev(t, QPointF(local), QPointF(bar2->mapToGlobal(local)),
+                           Qt::LeftButton,
+                           t == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton,
+                           Qt::NoModifier);
+            QApplication::sendEvent(bar2, &ev);
+        };
+        send2(QEvent::MouseButtonPress, grab);
+        send2(QEvent::MouseMove, grab + QPoint(20, 0));
+        send2(QEvent::MouseMove, bar2->mapFromGlobal(leftEdge));
+        send2(QEvent::MouseButtonRelease, bar2->mapFromGlobal(leftEdge));
+        check(brushes->group() && brushes->group() != dst,
+              "dropping near a group's edge splits it off into its own group");
+        check(brushes->group()->area() == dm->mainArea(),
+              "an edge drop stays docked rather than floating away");
+    }
+
+    // ---- dropping outside every dock area floats the panel ----
+    {
+        QApplication::processEvents();
+        DockGroup* src = layers->group();
+        DockTabBar* bar = src->tabBar();
+        const QPoint grab = bar->tabRect(src->indexOf(layers)).center();
+        const QRect win(w.mapToGlobal(QPoint(0, 0)), w.size());
+        const QPoint outside(win.right() + 220, win.center().y());
+        auto send = [&](QEvent::Type t, const QPoint& local) {
+            QMouseEvent ev(t, QPointF(local), QPointF(bar->mapToGlobal(local)),
+                           Qt::LeftButton,
+                           t == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton,
+                           Qt::NoModifier);
+            QApplication::sendEvent(bar, &ev);
+        };
+        send(QEvent::MouseButtonPress, grab);
+        send(QEvent::MouseMove, grab + QPoint(20, 0));
+        send(QEvent::MouseMove, bar->mapFromGlobal(outside));
+        send(QEvent::MouseButtonRelease, bar->mapFromGlobal(outside));
+        check(layers->group() && layers->group()->area()
+                  && layers->group()->area()->floatingWindow(),
+              "dropping past the window edge tears the panel into a floating workspace");
+    }
+
+    fprintf(stderr, failures ? "DOCKTEST: %d FAILURES\n" : "DOCKTEST: ALL PASS\n", failures);
+    return failures;
+}
+
 static void applyDarkTheme(QApplication& app)
 {
     // Fusion, wrapped so tooltips appear instantly instead of after ~700ms.
     app.setStyle(new InstantTooltipStyle(QStyleFactory::create("Fusion")));
+
+    // One normal-weight grotesque, one size up from Qt's cramped default —
+    // hierarchy comes from size and tone, never from thickness.
+    app.setFont(Theme::uiFont(13));
+
     QPalette p;
-    QColor window(32, 32, 34), base(26, 26, 28), text(222, 222, 226),
-           button(42, 42, 45), highlight(79, 124, 255), disabled(120, 120, 128);
+    QColor window(Theme::Shell), base(Theme::Panel), text(Theme::Text),
+           button(Theme::Raised), highlight(Theme::AccentDim), disabled(Theme::Text4);
     p.setColor(QPalette::Window, window);
     p.setColor(QPalette::WindowText, text);
     p.setColor(QPalette::Base, base);
@@ -376,110 +590,8 @@ static void applyDarkTheme(QApplication& app)
     p.setColor(QPalette::Disabled, QPalette::WindowText, disabled);
     app.setPalette(p);
 
-    // Borderless, flat, modern-Photoshop chrome. No bevels or glossy frames —
-    // panels read as one continuous dark surface separated only by subtle tone.
-    app.setStyleSheet(R"(
-        QMainWindow, QMainWindow > QWidget { background: #202022; }
-        QMainWindow::separator { background: #202022; width: 4px; height: 4px; }
-        QMainWindow::separator:hover { background: #33333a; }
-
-        /* menu bar / file-edit strip — flat, no underline frame */
-        QMenuBar { background: #202022; border: none; padding: 2px 4px; }
-        QMenuBar::item { background: transparent; padding: 4px 9px; margin: 0; border-radius: 5px; color: #cfcfd4; }
-        QMenuBar::item:selected { background: #303036; color: #ffffff; }
-        QMenuBar::item:pressed { background: #3a3a42; }
-        QMenu { background: #26262a; border: 1px solid #34343a; padding: 4px; }
-        QMenu::item { padding: 5px 22px 5px 20px; border-radius: 5px; }
-        QMenu::item:selected { background: #4f7cff; color: #ffffff; }
-        QMenu::separator { height: 1px; background: #34343a; margin: 4px 8px; }
-
-        /* toolbars — no handles, no borders */
-        QToolBar { background: #202022; border: none; padding: 2px; spacing: 2px; }
-        QToolBar::separator { background: #313138; width: 1px; height: 1px; margin: 4px; }
-        QToolButton { background: transparent; border: none; border-radius: 6px; padding: 4px; color: #cfcfd4; }
-        QToolButton:hover { background: #303036; }
-        QToolButton:pressed { background: #3a3a42; }
-        QToolButton:checked { background: #34435f; }
-
-        /* status bar */
-        QStatusBar { background: #1c1c1e; border-top: 1px solid #2a2a2e; color: #9a9aa2; }
-        QStatusBar::item { border: none; }
-
-        /* dock panels — no frame. No ::title rule: every dock uses a custom
-           DockTitleBar strip, and ::title padding would squeeze it into
-           eliding its own tab labels. */
-        QDockWidget { titlebar-close-icon: none; titlebar-normal-icon: none;
-                      color: #b6b6be; font-size: 11px; }
-        QDockWidget > QWidget { background: #242427; }
-
-        /* the grab strip between stacked panels — the horizontal divider you
-           drag to resize. Wide enough to hit, tinted on hover so it reads. */
-        QMainWindow::separator { background: #2a2a2e; height: 4px; width: 4px; }
-        QMainWindow::separator:hover { background: #4f7cff; }
-
-        /* DockTitleBar paints its own tab strip — it needs no stylesheet rules.
-           Qt's native dock tab bar is suppressed in code (QTabBar child of
-           QMainWindow, height 0) so tabbed panels show one header, not two. */
-
-        /* tab bars inside panels — NOT the dock tab bar, which is hidden */
-        QTabBar::tab { background: transparent; color: #8a8a92; padding: 6px 12px;
-                       border: none; margin-right: 2px; }
-        QTabBar::tab:selected { color: #f0f0f4; }
-        QTabBar::tab:hover { color: #d4d4da; }
-        QTabWidget::pane { border: none; }
-
-        /* document tabs across the top of the canvas */
-        #docTabs::pane { border: none; background: #17171a; }
-        #docTabs QTabBar::tab { background: #202022; color: #9a9aa2; padding: 6px 16px;
-                                border: none; border-right: 1px solid #191919; }
-        #docTabs QTabBar::tab:selected { background: #17171a; color: #f0f0f4; }
-        #docTabs QTabBar::tab:hover:!selected { background: #262629; }
-
-        /* inputs */
-        QLineEdit, QSpinBox, QComboBox, QFontComboBox {
-            background: #1a1a1c; border: 1px solid #313138; border-radius: 5px;
-            padding: 3px 6px; color: #e4e4e8; selection-background-color: #4f7cff;
-        }
-        QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QFontComboBox:focus { border-color: #4f7cff; }
-        QComboBox::drop-down, QFontComboBox::drop-down { border: none; width: 16px; }
-        QComboBox QAbstractItemView { background: #26262a; border: 1px solid #34343a;
-                                      selection-background-color: #4f7cff; outline: none; }
-
-        QListWidget, QUndoView { background: #1c1c1e; border: 1px solid #2a2a2e;
-                                 border-radius: 6px; outline: none; }
-        QListWidget::item { border-radius: 4px; padding: 1px; }
-        QListWidget::item:selected { background: #34435f; }
-        QListWidget::item:hover:!selected { background: #26262b; }
-
-        QPushButton { background: #2c2c31; border: 1px solid #38383f; border-radius: 6px;
-                      padding: 5px 12px; color: #e0e0e4; }
-        QPushButton:hover { background: #34343a; border-color: #45454e; }
-        QPushButton:pressed { background: #2a2a30; }
-
-        QCheckBox { color: #c8c8d0; spacing: 6px; }
-        QLabel { color: #c8c8d0; }
-
-        /* sliders — thin flat track, round handle */
-        QSlider::groove:horizontal { height: 4px; background: #34343a; border-radius: 2px; }
-        QSlider::sub-page:horizontal { background: #4f7cff; border-radius: 2px; }
-        QSlider::handle:horizontal { background: #e8e8ee; width: 13px; height: 13px;
-                                     margin: -5px 0; border-radius: 7px; }
-        QSlider::handle:horizontal:hover { background: #ffffff; }
-
-        /* scrollbars — slim, no arrows */
-        QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-        QScrollBar::handle:vertical { background: #3a3a42; border-radius: 5px; min-height: 32px; }
-        QScrollBar::handle:vertical:hover { background: #4a4a54; }
-        QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
-        QScrollBar::handle:horizontal { background: #3a3a42; border-radius: 5px; min-width: 32px; }
-        QScrollBar::handle:horizontal:hover { background: #4a4a54; }
-        QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
-        QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-
-        /* tooltips — dark card, readable at a glance */
-        QToolTip { background: #2a2a30; color: #ececf2; border: 1px solid #3a3a44;
-                   border-radius: 6px; padding: 6px 9px; font-size: 11px; }
-    )");
+    app.setStyleSheet(Theme::styleSheet());
+    app.installEventFilter(new RoundTooltips);
 }
 
 int main(int argc, char** argv)
@@ -499,6 +611,7 @@ int main(int argc, char** argv)
     bool homeshot = args.removeAll("--homeshot") > 0;
     bool paletteshot = args.removeAll("--paletteshot") > 0;
     bool tabshot = args.removeAll("--tabshot") > 0;
+    bool docktest = args.removeAll("--docktest") > 0;
     bool historyshot = args.removeAll("--historyshot") > 0;
     QString diffShotPath;
     for (int i = args.size() - 1; i >= 0; --i) {
@@ -521,6 +634,13 @@ int main(int argc, char** argv)
             args.removeAt(i);
         }
     }
+    QString toolName;
+    for (int i = args.size() - 1; i >= 0; --i) {
+        if (args[i].startsWith("--tool=")) {
+            toolName = args[i].mid(7);
+            args.removeAt(i);
+        }
+    }
     if (modeltest) {
         int rc = 1;
         QTimer::singleShot(300, &app, [&] {
@@ -529,8 +649,16 @@ int main(int argc, char** argv)
         });
         return app.exec();
     }
+
+    if (docktest) {
+        // 300ms in: the workspace has settled and any saved layout is applied.
+        QTimer::singleShot(300, &app, [&] { QApplication::exit(runDockTest(w)); });
+        return app.exec();
+    }
+    // Startup never interrupts with a dialog: a path that no longer opens just
+    // drops you on the home screen.
     for (const QString& a : args)
-        if (!a.startsWith("-")) w.openPath(a);
+        if (!a.startsWith("-")) w.openPath(a, /*quiet=*/true);
 
     if (homeshot) {
         w.showHome();
@@ -645,6 +773,9 @@ int main(int argc, char** argv)
     if (selftest) {
         if (!w.currentDoc())
             w.newDocument(QSize(1000, 700), Qt::white);
+        // --tool=<name> picks a tool first, so a shot can show the options strip
+        // a given tool brings with it (or prove it brings none).
+        if (!toolName.isEmpty()) w.runPaletteCommand(toolName);
         QTimer::singleShot(900, &app, [&] {
             if (!shotPath.isEmpty()) w.grab().save(shotPath);
             QApplication::quit();

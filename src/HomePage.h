@@ -44,20 +44,23 @@ signals:
 protected:
     void showEvent(QShowEvent*) override;
     void resizeEvent(QResizeEvent*) override;
+    void keyPressEvent(QKeyEvent*) override;
 
 private:
     void rebuildGrid();
     void applyColumnWidth();
+    int  maxColumns() const;   // how many cards fit across the window
 
-    QWidget* m_column = nullptr;      // the centred ~60% content column
+    QWidget* m_column = nullptr;      // the centred content column
     QLineEdit* m_search = nullptr;
     QScrollArea* m_scroll = nullptr;
     QGridLayout* m_gridLay = nullptr;
     QWidget* m_gridHost = nullptr;
     QLabel* m_sectionLabel = nullptr;
-    QLabel* m_countLabel = nullptr;
     QWidget* m_empty = nullptr;
     QLabel* m_emptyText = nullptr;
     QList<RecentEntry> m_entries;
+    QList<QWidget*> m_cards;          // in grid order, for arrow-key navigation
+    int m_cols = 0;            // columns actually in use; 0 = nothing shown
     QString m_filter;
 };

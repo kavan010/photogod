@@ -1,4 +1,5 @@
 #include "Canvas.h"
+#include "Theme.h"
 #include "Commands.h"
 #include "Dialogs.h"
 #include <QPainter>
@@ -101,11 +102,21 @@ void Canvas::fitToWindow()
     update();
 }
 
-void Canvas::resizeEvent(QResizeEvent*)
+void Canvas::resizeEvent(QResizeEvent* e)
 {
     if (!m_fitted && width() > 20) {
         m_fitted = true;
         fitToWindow();
+        return;
+    }
+    // Panels can now be dragged and resized around the canvas, so the viewport
+    // changes size constantly. Zoom stays put; whatever point sat in the middle
+    // of the view stays in the middle of it, so it's the frame that moves and
+    // not the picture.
+    if (e->oldSize().isValid()) {
+        m_pan += QPointF((width()  - e->oldSize().width())  / 2.0,
+                         (height() - e->oldSize().height()) / 2.0);
+        update();
     }
 }
 
@@ -135,17 +146,30 @@ void Canvas::enterEvent(QEnterEvent* e)
 void Canvas::paintEvent(QPaintEvent*)
 {
     QPainter p(this);
-    p.fillRect(rect(), QColor(36, 36, 40));
+    // The surround is the darkest surface in the app so the image reads as the
+    // only lit thing on screen.
+    p.fillRect(rect(), Theme::color(Theme::Void));
 
     QRectF docW(m_pan, QSizeF(m_doc->width() * m_zoom, m_doc->height() * m_zoom));
 
-    // checkerboard
+    // A soft falloff under the document — enough to lift it off the backdrop,
+    // not enough to notice you were shown a shadow.
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setBrush(Qt::NoBrush);
+    for (int i = 14; i >= 1; --i) {
+        p.setPen(QPen(QColor(0, 0, 0, 8 + (14 - i)), 1));
+        p.drawRect(docW.adjusted(-i, -i + 1, i, i + 2));
+    }
+    p.setRenderHint(QPainter::Antialiasing, false);
+
+    // checkerboard — mid-dark and neutral, so transparency reads without
+    // shouting over the artwork sitting on top of it
     static QPixmap checker = [] {
         QPixmap pm(16, 16);
-        pm.fill(QColor(190, 190, 190));
+        pm.fill(QColor(58, 58, 62));
         QPainter cp(&pm);
-        cp.fillRect(0, 0, 8, 8, QColor(150, 150, 150));
-        cp.fillRect(8, 8, 8, 8, QColor(150, 150, 150));
+        cp.fillRect(0, 0, 8, 8, QColor(48, 48, 52));
+        cp.fillRect(8, 8, 8, 8, QColor(48, 48, 52));
         return pm;
     }();
     p.setBrushOrigin(m_pan.toPoint());
@@ -254,7 +278,7 @@ void Canvas::paintEvent(QPaintEvent*)
         QString hint;
         if (m_xf.mode == XformMode::Warp) {
             int n = XForm::kWarpGrid, cols = n + 1;
-            p.setPen(QPen(QColor(90, 160, 255), 1.5));
+            p.setPen(QPen(Theme::color(Theme::Accent), 1.5));
             for (int row = 0; row <= n; ++row) {
                 QPolygonF line;
                 for (int col = 0; col <= n; ++col) line << docToWidget(m_xf.warpPts[row * cols + col]);
@@ -276,7 +300,7 @@ void Canvas::paintEvent(QPaintEvent*)
             QPolygonF quad = xfCurrentQuad();
             QPolygonF box;
             for (const auto& pt : quad) box << docToWidget(pt);
-            p.setPen(QPen(QColor(90, 160, 255), 1.5));
+            p.setPen(QPen(Theme::color(Theme::Accent), 1.5));
             p.setBrush(Qt::NoBrush);
             p.drawPolygon(box);
 
@@ -690,12 +714,12 @@ void Canvas::textToolClick(const QPointF& docPos)
     }
 }
 
-void Canvas::pickColor(const QPointF& docPos)
+void Canvas::pickColor(const QPointF& docPos, bool commit)
 {
     QPoint pt = docPos.toPoint();
     if (!m_doc->rect().contains(pt)) return;
     QRgb c = m_doc->composite().convertToFormat(QImage::Format_ARGB32).pixel(pt);
-    emit colorPicked(QColor(qRed(c), qGreen(c), qBlue(c)));
+    emit colorPicked(QColor(qRed(c), qGreen(c), qBlue(c)), commit);
 }
 
 // ============================ transform ============================
@@ -1034,7 +1058,7 @@ void Canvas::drawRulersAndGuides(QPainter& p)
 {
     // guides
     p.setRenderHint(QPainter::Antialiasing, false);
-    p.setPen(QColor(0, 200, 220));
+    p.setPen(Theme::color(Theme::Accent, 190));
     for (double g : m_doc->guidesV) {
         int x = int(std::lround(docToWidget(QPointF(g, 0)).x()));
         p.drawLine(x, 0, x, height());
@@ -1044,7 +1068,7 @@ void Canvas::drawRulersAndGuides(QPainter& p)
         p.drawLine(0, y, width(), y);
     }
     if (m_act == Act::GuideDrag) {
-        p.setPen(QPen(QColor(80, 230, 255), 2));
+        p.setPen(QPen(Theme::color(Theme::Accent), 2));
         if (m_guideOrient == 0) {
             int y = int(std::lround(docToWidget(QPointF(0, m_guideVal)).y()));
             p.drawLine(0, y, width(), y);
@@ -1055,10 +1079,10 @@ void Canvas::drawRulersAndGuides(QPainter& p)
     }
 
     // ruler strips
-    QColor strip(28, 28, 31), tick(120, 120, 125), label(160, 160, 165);
+    QColor strip(Theme::Shell), tick(Theme::Text4), label(Theme::Text3);
     p.fillRect(QRect(0, 0, width(), kRuler), strip);
     p.fillRect(QRect(0, 0, kRuler, height()), strip);
-    p.setPen(QColor(60, 60, 65));
+    p.setPen(Theme::color(Theme::Line));
     p.drawLine(0, kRuler, width(), kRuler);
     p.drawLine(kRuler, 0, kRuler, height());
 
@@ -1219,7 +1243,8 @@ void Canvas::mousePressEvent(QMouseEvent* e)
     case ToolType::Eraser:
     case ToolType::Blur:
         if (e->modifiers() & Qt::AltModifier) {
-            pickColor(dp);
+            pickColor(dp, false);
+            m_act = Act::Pick;
             break;
         }
         if (beginStroke(dp, m_tool == ToolType::Eraser, m_tool == ToolType::Blur)) {
@@ -1246,7 +1271,10 @@ void Canvas::mousePressEvent(QMouseEvent* e)
         m_cropValid = false;
         break;
     case ToolType::Eyedropper:
-        pickColor(dp);
+        // live-sample while the button is held; the pick is only committed
+        // (recent colours, status message) on release
+        pickColor(dp, false);
+        m_act = Act::Pick;
         break;
     case ToolType::Gradient:
         m_act = Act::GradDrag;
@@ -1286,6 +1314,9 @@ void Canvas::mouseMoveEvent(QMouseEvent* e)
         break;
     case Act::Stroke:
         strokeTo(dp);
+        break;
+    case Act::Pick:
+        pickColor(dp, false);
         break;
     case Act::MoveLayer: {
         auto l = m_doc->activeLayer();
@@ -1409,6 +1440,9 @@ void Canvas::mouseReleaseEvent(QMouseEvent* e)
         break;
     case Act::Stroke:
         endStroke();
+        break;
+    case Act::Pick:
+        pickColor(dp);
         break;
     case Act::MoveLayer: {
         auto l = m_doc->activeLayer();

@@ -30,17 +30,20 @@ enum class ToolType {
 };
 
 struct ToolSettings {
-    int  brushSize     = 40;
-    int  brushOpacity  = 100;   // percent
+    // Opening state: a fat black marker. You land in the app already holding
+    // the bluntest, most obvious thing to draw with — no setup, just paint.
+    // These four are the "Marker" preset from BrushesPanel, at max size.
+    int  brushSize     = 500;   // the top of the size slider
+    int  brushOpacity  = 55;    // percent
     int  brushFlow     = 100;   // percent
-    int  brushHardness = 80;    // percent
+    int  brushHardness = 95;    // percent
     int  brushNoise    = 0;     // percent, texture grain
     bool pressureSize    = true;
     bool pressureOpacity = false;
 
     int blurRadius = 10;        // gaussian blur brush radius
 
-    bool showRulers = true;     // rulers + guides overlay
+    bool showRulers = false;    // rulers + guides overlay — off until asked for
     bool snapping   = true;     // snap to guides / canvas edges
 
     int  wandTolerance  = 32;
